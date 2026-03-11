@@ -1,0 +1,50 @@
+modules:
+  - type: files
+    files:
+      - source: system
+        destination: /
+  - type: dnf
+    repos:
+      files:
+        - docker-ce.repo
+      keys:
+        - https://download.docker.com/linux/fedora/gpg
+    group-install:
+      with-optional: true
+      packages:
+        - development-tools
+        - c-development
+    remove:
+      packages:
+        - moby-engine
+        - docker-cli
+    install:
+      packages:
+        - usbguard
+        - android-tools
+        - arm-image-installer
+        - hunspell-devel
+        - zsh
+        - autofs
+        - wireguard-tools
+        - trash-cli
+        - git
+        - git-filter-repo
+        - firewall-config
+        - alsa-tools
+        - libappstream-glib
+        - htop
+        - glances
+        - ansible
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+        - docker-buildx-plugin
+        - docker-compose-plugin
+        - freeipa-client
+        - chromium-headless
+  - type: systemd
+    system:
+      enabled:
+        - docker.service
+  - type: signing

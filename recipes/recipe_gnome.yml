@@ -1,8 +1,0 @@
-name: bazzite-badblocks-gnome
-description: badblocks's custom bazzite-gnome build
-
-base-image: ghcr.io/ublue-os/bazzite-gnome
-image-version: latest
-
-modules:
-  - from-file: common-modules.yml

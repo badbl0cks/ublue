@@ -1,8 +1,0 @@
-name: bazzite-badblocks-gnome-nvidia-open
-description: badblocks's custom bazzite-gnome-nvidia-open build
-
-base-image: ghcr.io/ublue-os/bazzite-gnome-nvidia-open
-image-version: latest
-
-modules:
-  - from-file: common-modules.yml

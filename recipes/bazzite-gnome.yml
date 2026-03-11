@@ -1,0 +1,47 @@
+---
+# yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
+name: bazzite-gnome-badblocks
+description: Customizations of bazzite-gnome with all video drivers for personal use
+
+base-image: ghcr.io/ublue-os/bazzite-gnome-nvidia-open
+image-version: latest
+
+modules:
+  - from-file: base.yml
+  - from-file: gui.yml
+  - type: files
+    files:
+      - source: firmware
+        destination: /lib/firmware/
+  - type: dnf
+    install:
+      packages:
+        - mpv_inhibit_gnome
+        - git-credential-libsecret
+        - gtk-murrine-engine
+        - gnome-boxes
+        - fedora-chromium-config-gnome
+  - type: gnome-extensions
+    install:
+      - 6 # Applications Menu
+      - 1460 # Vitals
+      - 1160 # Dash to Panel
+      - 97 # Coverflow Alt-Tab
+      - 8671 # All-in-One Clipboard
+      - 7856 # Mouse Tail
+      - 8971 # Lock Guard
+      - 4338 # Allow Locked Remote Desktop
+      # Below are provided currently by Bazzite
+      #- 615 # *AppIndicator and KStatusNotifierItem Support
+      #- 8760 # *Add to Steam
+      #- 3193 # *Blur my Shell
+      #- 517 # *Caffeine
+      #- 3740 # *Compiz alike magic lamp effect
+      #- 3210 # *Compiz windows effect
+      #- 7215 # *Restart To
+      #- 19 # *User Themes
+      #- 1319 # *GSConnect (Commented out as this extension will not work if installed system-wide without compile-time modifications, bazzite includes a modified version)
+      #- 4451 # *Logo Menu (Commented out as Bazzite includes customizations with their install)
+  - type: gschema-overrides
+    include:
+      - zz1-power-button-settings.gschema.override

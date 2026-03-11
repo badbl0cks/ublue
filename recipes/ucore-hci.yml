@@ -1,0 +1,10 @@
+---
+# yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
+name: ucore-hci-badblocks
+description: Customizations of ucore for personal use
+
+base-image: ghcr.io/ublue-os/ucore-hci
+image-version: lts
+
+modules:
+  - from-file: base.yml

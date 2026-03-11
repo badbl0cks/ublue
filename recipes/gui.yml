@@ -1,0 +1,66 @@
+modules:
+  - type: fonts
+    fonts:
+      nerd-fonts:
+        - FiraCode
+        - Hack
+        - SourceCodePro
+        - Terminus
+        - JetBrainsMono
+        - NerdFontsSymbolsOnly
+      google-fonts:
+        - Roboto
+        - Lexend
+  - type: dnf
+    repos:
+      files:
+        - https://packages.microsoft.com/yumrepos/vscode/config.repo
+        - https://copr.fedorainfracloud.org/coprs/lizardbyte/stable/repo/fedora-43/lizardbyte-stable-fedora-43.repo
+      keys:
+        - https://packages.microsoft.com/keys/microsoft.asc
+        - https://download.copr.fedorainfracloud.org/results/lizardbyte/stable/pubkey.gpg
+    install:
+      packages:
+        - vlc
+        - mpv
+        - libvirt
+        - virt-manager
+        - code
+        - sunshine
+        - chromium
+        - chromedriver
+        - gstreamer1-plugins-ugly-free
+        - gstreamer1-plugins-bad-free
+        - gstreamer1-plugins-bad-free-extras
+        - gstreamer1-plugins-good
+        - gstreamer1-plugins-good-extras
+        - gstreamer1-plugins-base
+        - gstreamer1-plugins-base-tools
+  - type: default-flatpaks@v1 # only v1 allows removals
+    notify: true
+    system:
+      install:
+        - net.nokyan.Resources
+        - org.gimp.GIMP
+        - org.libreoffice.LibreOffice
+        - page.codeberg.libre_menu_editor.LibreMenuEditor
+        - us.zoom.Zoom
+        - com.bitwarden.desktop
+        - dev.zed.Zed
+        - dev.goats.xivlauncher
+        - com.github.zocker_160.SyncThingy
+        - io.github.vikdevelop.SaveDesktop
+        - md.obsidian.Obsidian
+        - org.strawberrymusicplayer.strawberry
+        - com.discordapp.Discord
+        - com.borgbase.Vorta
+        - org.mozilla.Thunderbird
+        - io.gitlab.librewolf-community
+        - io.github.ungoogled_software.ungoogled_chromium
+      remove:
+        - org.gnome.Boxes
+        - org.videolan.VLC
+    user:
+      remove:
+        - org.gnome.Boxes
+        - org.videolan.VLC
