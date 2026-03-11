@@ -1,20 +1,19 @@
-# ublue-custom &nbsp; [![bluebuild build badge](https://github.com/badbl0cks/bazzite-custom/actions/workflows/build.yml/badge.svg)](https://github.com/badbl0cks/bazzite-custom/actions/workflows/build.yml)
+# ublue-custom &nbsp; [![bluebuild build badge](https://github.com/badbl0cks/ublue/actions/workflows/build.yml/badge.svg)](https://github.com/badbl0cks/ublue/actions/workflows/build.yml)
 
-See the [BlueBuild docs](https://blue-build.org/how-to/setup/) for quick setup instructions for setting up your own repository based on this template.
+These are customizations of upstream Universal Blue images, which themselves are customizations of Fedora CoreOS.
 
-After setup, it is recommended you update this README to describe your custom image.
+## Prepare
+
+If you are not yet on an existing atomic Fedora installation, you will first need to install your choice of one normally (e.g. Bazzite via ISO on bare metal).
+Once installed, you can use that installation to complete the steps below.
 
 ## Installation
 
-> **Warning**
-> [This is an experimental feature](https://www.fedoraproject.org/wiki/Changes/OstreeNativeContainerStable), try at your own discretion.
-First, install Bazzite normally, then rebase to this custom version!
-
-To rebase an existing atomic Fedora installation to this build, including Bazzite:
+To rebase an existing atomic Fedora installation to this build, including any ublue-based installation:
 
 - First rebase to the unsigned image, to get the proper signing keys and policies installed:
   ```
-  rpm-ostree rebase ostree-unverified-registry:ghcr.io/badbl0cks/bazzite-badblocks-gnome:latest
+  rpm-ostree rebase ostree-unverified-registry:ghcr.io/badbl0cks/bazzite-gnome-badblocks:latest
   ```
 - Reboot to complete the rebase:
   ```
@@ -22,7 +21,7 @@ To rebase an existing atomic Fedora installation to this build, including Bazzit
   ```
 - Then rebase to the signed image, like so:
   ```
-  rpm-ostree rebase ostree-image-signed:docker://ghcr.io/badbl0cks/bazzite-badblocks-gnome:latest
+  rpm-ostree rebase ostree-image-signed:docker://ghcr.io/badbl0cks/bazzite-gnome-badblocks:latest
   ```
 - Reboot again to complete the installation
   ```
@@ -32,8 +31,8 @@ To rebase an existing atomic Fedora installation to this build, including Bazzit
 ## Images
 
 Currently the following images are available:
-- bazzite-badblocks-gnome
-- bazzite-badblocks-gnome-nvidia-open
+- bazzite-gnome-badblocks (Desktop gaming)
+- ucore-hci-badblocks (Server/NAS-oriented)
 
 
 ## Verification
@@ -41,5 +40,5 @@ Currently the following images are available:
 These images are signed with [Sigstore](https://www.sigstore.dev/)'s [cosign](https://github.com/sigstore/cosign). You can verify the signature by downloading the `cosign.pub` file from this repo and running the following command:
 
 ```bash
-cosign verify --key cosign.pub ghcr.io/badbl0cks/bazzite-custom
+cosign verify --key cosign.pub ghcr.io/badbl0cks/ublue
 ```
