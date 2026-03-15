@@ -36,6 +36,7 @@ modules:
         - gstreamer1-plugins-good-extras
         - gstreamer1-plugins-base
         - gstreamer1-plugins-base-tools
+        - baobab
   - type: default-flatpaks@v1 # only v1 allows removals
     notify: true
     system:
