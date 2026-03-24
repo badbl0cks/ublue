@@ -11,6 +11,10 @@ modules:
   - from-file: gui.yml
   - type: files
     files:
+      - source: hostname/bazzite-gnome
+        destination: /etc
+  - type: files
+    files:
       - source: firmware
         destination: /lib/firmware/
   - type: dnf
