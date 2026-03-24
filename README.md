@@ -9,28 +9,31 @@ need to install by rebasing from an existing installation. If you do not yet hav
 rebase from, you will first need to install your choice of one normally (e.g. Silverblue/Bazzite/CoreOS/etc)
 before continuing. After completing the installation, you can complete the steps below.
 
-> [!WARNING]
+> [!CAUTION]
 > If you are installing uCore (which is based off of Fedora CoreOS), rebasing from Fedora IoT or any of the 
-> Atomic Desktops (e.g. Silverblue) is NOT supported! CoreOS images must be provisioned with an 
-> [ignition config](https://docs.fedoraproject.org/en-US/fedora-coreos/producing-ign/) and do not offer GUI 
-> installers. If ignition doesn't provide a desired feature, then CoreOS doesn't support that feature, and 
-> subsequently uCore won't either. Rebasing from a non CoreOS-based system to gain a filesystem feature or 
-> GUI installation is very likely to cause problems later on.
+> Atomic Desktops (e.g. Silverblue) is NOT supported! You MUST only rebase from CoreOS or CoreOS-based images. 
+> CoreOS must be provisioned with an [ignition config](https://docs.fedoraproject.org/en-US/fedora-coreos/producing-ign/) 
+> and does not offer a GUI installer. If ignition doesn't provide a desired feature, then CoreOS doesn't support that 
+> feature, and subsequently uCore won't either. Rebasing from a non CoreOS-based system, indirectly or not, to gain a  
+> filesystem feature or GUI installation is very likely to cause problems later on.
 
 ## Images
 
 Currently the following custom images are available:
 - bazzite-gnome-badblocks (desktop/gaming-oriented)
-  > Based on Bazzite, a custom Fedora Atomic image built with cloud native technology that brings the best of Linux gaming to all of your devices - including your favorite handheld.
+  > Based on Bazzite, a custom Fedora Atomic Desktop image built with cloud-native technology that brings the best of Linux gaming to all of your devices - including your favorite handheld!
 - ucore-hci-badblocks (server/NAS-oriented; REQUIRES IGNITION)
-  > Based on uCore, an OCI image of Fedora CoreOS with "batteries included". More specifically, it's an opinionated, custom CoreOS image, built daily with some common tools added in. The idea is to make a lightweight server image including commonly used services or the building blocks to host them.
+  > Based on uCore, an opinionated, lightweight, server-oriented CoreOS-based image with "batteries included". It's secure by default, auto-updating, and includes commonly used services, tools, and the building blocks needed to host them.  
+  
+> [!TIP]
+> If installing uCore on a VPS, try using BIOS instead of UEFI, or you may encouter problems if SecureBoot or TPM2 is misconfigured on the physical server hosting the VPS.
 
 ## Rebasing
 
 Rebasing is the only supported installation method for these custom images. To rebase an existing atomic Fedora 
 installation to one of these custom builds, follow the steps below.
 
-> [!HINT]
+> [!NOTE]
 > Be sure to replace &lt;IMAGE-NAME&gt; in the commands below with the actual image name you want to use.
 
 - First rebase to the unsigned image, in order to properly import this repository's signing keys and policies:
