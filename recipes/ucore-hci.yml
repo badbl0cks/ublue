@@ -20,3 +20,6 @@ modules:
     system:
       enabled:
         - syncthing@core.service
+  - type: script
+    snippets:
+      - "mkdir /var/srv && chown 1000:1000 /var/srv"
