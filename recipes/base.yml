@@ -41,7 +41,8 @@ modules:
         - containerd.io
         - docker-buildx-plugin
         - docker-compose-plugin
-        - freeipa-client
+        # temporarily disabled due to upstream bug: https://github.com/fedora-selinux/selinux-policy/issues/3081
+        #- freeipa-client
         - chromium-headless
   - type: systemd
     system:
