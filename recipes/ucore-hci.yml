@@ -8,3 +8,11 @@ image-version: lts
 
 modules:
   - from-file: base.yml
+  - type: dnf
+    install:
+      packages:
+        - syncthing
+  - type: systemd
+    system:
+      enabled:
+        - syncthing@core.service
