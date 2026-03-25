@@ -16,10 +16,10 @@ modules:
     install:
       packages:
         - syncthing
+  - type: script
+    scripts:
+      - syncthing-setup.sh
   - type: systemd
     system:
       enabled:
-        - syncthing@core.service
-  - type: script
-    snippets:
-      - "mkdir /var/srv && chown 1000:1000 /var/srv"
+        - syncthing@sync.service
