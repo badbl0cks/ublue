@@ -8,3 +8,7 @@ image-version: lts
 
 modules:
   - from-file: base.yml
+  - type: files
+    files:
+      - source: hostname/ucore-hci
+        destination: /etc
