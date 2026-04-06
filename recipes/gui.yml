@@ -37,6 +37,7 @@ modules:
         - gstreamer1-plugins-base
         - gstreamer1-plugins-base-tools
         - baobab
+        - tilda
   - type: default-flatpaks@v1 # only v1 allows removals
     notify: true
     system:
