@@ -11,6 +11,11 @@ modules:
       google-fonts:
         - Roboto
         - Lexend
+      url-fonts:
+        - name: MapleMono-NF-CN
+          url: https://github.com/subframe7536/maple-font/releases/latest/download/MapleMono-NF-CN-unhinted.zip
+        - name: MapleMono-NF
+          url: https://github.com/subframe7536/maple-font/releases/latest/download/MapleMono-NF-unhinted.zip
   - type: dnf
     repos:
       files:
