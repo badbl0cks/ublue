@@ -44,11 +44,15 @@ modules:
         # temporarily disabled due to upstream bug: https://github.com/fedora-selinux/selinux-policy/issues/3081
         #- freeipa-client
         - chromium-headless
+        - python3
         - python3-devel
+        - openssl
         - samba
         - ncdu
   - type: systemd
     system:
       enabled:
         - docker.service
+        - firstboot-sshd.service
+        - sshd.service
   - type: signing

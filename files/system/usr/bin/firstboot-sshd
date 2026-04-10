@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WD="/etc/ssh"
+cd "${WD}"
+
+# implements sshaudit.com hardening guide recommendations for Rocky Linux 9 (closest to Fedora)
+# last update 2024: https://oam7575.github.io/ssh_hardening_guides/index.html#rocky_9
+
+if [[ -f "${WD}/.firstboot" ]]; then
+    # Implement connection rate throttling in order to protect against the DHEat denial-of-service attack.
+    firewall-cmd --direct --add-rule ipv4 filter INPUT 0 -p tcp --dport 22 -m state --state NEW -m recent --set --permanent > /dev/null
+    firewall-cmd --direct --add-rule ipv4 filter INPUT 1 -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP --permanent > /dev/null
+    firewall-cmd --direct --add-rule ipv6 filter INPUT 0 -p tcp --dport 22 -m state --state NEW -m recent --set --permanent > /dev/null
+    firewall-cmd --direct --add-rule ipv6 filter INPUT 1 -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP --permanent > /dev/null
+
+    # make sure the ssh service is allowed through the firewall and reload it to apply the new rules
+    firewall-cmd --add-service=ssh --permanent > /dev/null
+    firewall-cmd --reload > /dev/null
+
+    # Re-generate the RSA and ED25519 keys
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ""
+    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
+
+    # Enable only the ED25519 and RSA HostKey directives
+    sed -i 's/^#\?HostKey.*$//g' /etc/ssh/sshd_config
+    echo -e "\nHostKey /etc/ssh/ssh_host_ed25519_key\nHostKey /etc/ssh/ssh_host_rsa_key" >> /etc/ssh/sshd_config
+
+    # Remove small Diffie-Hellman moduli
+    awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.safe
+    mv -f /etc/ssh/moduli.safe /etc/ssh/moduli
+
+    # CUSTOM - not part of sshaudit.com hardening guide
+    sed -i 's/#\?\(Port\s*\).*$/\1 24/' /etc/ssh/sshd_config || echo "Port 24" >> /etc/ssh/sshd_config
+    sed -i 's/#\?\(PermitRootLogin\s*\).*$/\1 no/' /etc/ssh/sshd_config || echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+    sed -i 's/#\?\(PubkeyAuthentication\s*\).*$/\1 yes/' /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+    sed -i 's/#\?\(PermitEmptyPasswords\s*\).*$/\1 no/' /etc/ssh/sshd_config || echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
+    sed -i 's/#\?\(PasswordAuthentication\s*\).*$/\1 no/' /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+    sed -i 's/#\?\(AllowTcpForwarding\s*\).*$/\1 yes/' /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
+
+    # Mark first boot script as having run by removing the .firstboot file
+    rm -f "${WD}/.firstboot"
+    echo "First boot script completed."
+else
+    echo "First boot script already run (missing .firstboot file in ${WD}). Skipping..."
+fi
