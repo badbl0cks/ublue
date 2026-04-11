@@ -1,0 +1,15 @@
+[Unit]
+Description=First Boot Setup for a WireGuard interface
+ConditionPathExists=/etc/wireguard/.firstboot
+Before=wg-quick@wg0.service
+
+[Service]
+StandardOutput=journal+console
+Type=oneshot
+ExecStart=/usr/bin/firstboot-wireguard
+ExecStart=/usr/bin/systemctl disable firstboot-wg-quick@wg0.service
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
