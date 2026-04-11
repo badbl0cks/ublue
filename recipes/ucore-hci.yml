@@ -12,3 +12,12 @@ modules:
     files:
       - source: hostname/ucore-hci
         destination: /etc
+  - type: dnf
+    install:
+      packages:
+        - syncthing
+  - type: systemd
+    system:
+      enabled:
+        - firstboot-syncthing.service
+        - syncthing.service

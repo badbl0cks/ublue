@@ -1,0 +1,29 @@
+[Unit]
+Description=Syncthing - Open Source Continuous File Synchronization
+Documentation=man:syncthing(1)
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=4
+
+[Service]
+User=sync
+Type=exec
+ExecStart=/usr/bin/syncthing serve --no-browser --no-restart --no-default-folder --skip-port-probing --logflags=0 --data /var/srv/sync --config /etc/syncthing
+Restart=on-failure
+RestartSec=1
+SuccessExitStatus=3 4
+RestartForceExitStatus=3 4
+
+# Hardening
+ProtectSystem=full
+PrivateTmp=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+
+# Elevated permissions to sync ownership (disabled by default),
+# see https://docs.syncthing.net/advanced/folder-sync-ownership
+AmbientCapabilities=CAP_CHOWN CAP_FOWNER
+
+[Install]
+WantedBy=multi-user.target

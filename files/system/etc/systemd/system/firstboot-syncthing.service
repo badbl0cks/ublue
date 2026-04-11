@@ -1,0 +1,15 @@
+[Unit]
+Description=Syncthing - First Boot Setup
+ConditionPathExists=/etc/syncthing/.firstboot
+Before=syncthing.service
+
+[Service]
+StandardOutput=journal+console
+Type=oneshot
+ExecStart=/usr/bin/firstboot-syncthing
+ExecStart=/usr/bin/systemctl disable firstboot-syncthing.service
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
