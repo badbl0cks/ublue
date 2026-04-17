@@ -52,7 +52,6 @@ modules:
         - org.libreoffice.LibreOffice
         - page.codeberg.libre_menu_editor.LibreMenuEditor
         - us.zoom.Zoom
-        - com.bitwarden.desktop
         - dev.zed.Zed
         - dev.goats.xivlauncher
         - com.github.zocker_160.SyncThingy
