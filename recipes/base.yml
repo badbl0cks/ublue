@@ -7,7 +7,9 @@ modules:
     repos:
       files:
         - docker-ce.repo
+        - terra.repo
       keys:
+        - https://repos.fyralabs.com/terra43/key.asc
         - https://download.docker.com/linux/fedora/gpg
     group-install:
       with-optional: true
@@ -49,6 +51,7 @@ modules:
         - openssl
         - samba
         - ncdu
+        - terra-release
   - type: systemd
     system:
       enabled:

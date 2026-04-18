@@ -43,6 +43,7 @@ modules:
         - gstreamer1-plugins-base-tools
         - baobab
         - tilda
+        - zed
   - type: default-flatpaks@v1 # only v1 allows removals
     notify: true
     system:
@@ -52,12 +53,9 @@ modules:
         - org.libreoffice.LibreOffice
         - page.codeberg.libre_menu_editor.LibreMenuEditor
         - us.zoom.Zoom
-        - dev.zed.Zed
         - dev.goats.xivlauncher
         - com.github.zocker_160.SyncThingy
         - io.github.vikdevelop.SaveDesktop
-        - md.obsidian.Obsidian
-        - org.strawberrymusicplayer.strawberry
         - com.discordapp.Discord
         - com.borgbase.Vorta
         - org.mozilla.Thunderbird
