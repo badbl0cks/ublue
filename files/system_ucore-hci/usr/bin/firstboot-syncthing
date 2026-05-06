@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+WD="/etc/syncthing"
+cd "${WD}"
+
+if [[ ! -f "${WD}/.firstboot" ]]; then
+    echo "First boot detected. Running..."
+
+    firewall-cmd --permanent --add-service=syncthing > /dev/null
+    firewall-cmd --reload > /dev/null
+
+    getent passwd syncthing >/dev/null || useradd --home-dir /etc/syncthing --no-create-home --system --user-group --shell /sbin/nologin syncthing
+    chown -R syncthing:syncthing /var/srv /etc/syncthing
+
+    keys=("DEVICE_ID" "DEVICE_NAME" "INTRODUCER_ID" "DEVICE_IP" "DEVICE_NETWORK_CIDR" "APIKEY_32CHAR_BASE58")
+    config_xml="${WD}/config.xml"
+    cp -a "${config_xml}.template" "${config_xml}"
+
+    set -a
+    source "${WD}/config.env" || { echo "No config.env found, aborting..."; exit 1; }
+    set +a
+
+    for env_key in "${keys[@]}"; do
+        value="${!env_key:-}"
+        sed -i -e "s|{{${env_key}}}|${value}|g" "${config_xml}"
+    done
+
+    rm -f "${WD}/config.env"
+    touch "${WD}/.firstboot"
+    echo "First boot script completed."
+else
+    echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
+fi

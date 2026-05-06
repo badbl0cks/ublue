@@ -20,7 +20,7 @@ modules:
     repos:
       files:
         - https://packages.microsoft.com/yumrepos/vscode/config.repo
-        - https://copr.fedorainfracloud.org/coprs/lizardbyte/stable/repo/fedora-43/lizardbyte-stable-fedora-43.repo
+        - https://copr.fedorainfracloud.org/coprs/lizardbyte/stable/repo/fedora/lizardbyte-stable-fedora.repo
       keys:
         - https://packages.microsoft.com/keys/microsoft.asc
         - https://download.copr.fedorainfracloud.org/results/lizardbyte/stable/pubkey.gpg

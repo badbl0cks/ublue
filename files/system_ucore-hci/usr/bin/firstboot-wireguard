@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WD="/etc/wireguard"
+INTERFACE="${1:-wg0}"
+FIRSTBOOT_FILE="${WD}/.firstboot-${INTERFACE}"
+cd "${WD}"
+
+if [[ ! -f "${FIRSTBOOT_FILE}" ]]; then
+    echo "First boot detected. Running..."
+
+    firewall-cmd --permanent --add-service=wireguard > /dev/null
+    firewall-cmd --reload > /dev/null
+
+    keys=("ADDRESS" "PRIVATE_KEY" "PUBLIC_KEY" "ALLOWED_IPS" "ENDPOINT" "PRESHARED_KEY")
+    config_wg="${WD}/${INTERFACE}.conf"
+    cp -a "${config_wg}.template" "${config_wg}"
+
+    set -a
+    source "${WD}/config.env" || { echo "No config.env found, aborting..."; exit 1; }
+    set +a
+
+    for env_key in "${keys[@]}"; do
+        value="${!env_key:-}"
+        sed -i -e "s|{{${env_key}}}|${value}|g" "${config_wg}"
+    done
+
+    rm -f "${WD}/config.env"
+    touch "${FIRSTBOOT_FILE}"
+    echo "First boot script completed."
+else
+    echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
+
+fi

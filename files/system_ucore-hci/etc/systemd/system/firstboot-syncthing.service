@@ -1,7 +1,8 @@
 [Unit]
 Description=Syncthing - First Boot Setup
-ConditionPathExists=/etc/syncthing/.firstboot
-Before=syncthing.service
+ConditionPathExists=!/etc/syncthing/.firstboot
+Before=syncthing.service network.target
+After=network-pre.target
 
 [Service]
 StandardOutput=journal+console

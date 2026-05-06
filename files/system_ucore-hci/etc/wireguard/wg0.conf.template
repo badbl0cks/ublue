@@ -3,6 +3,7 @@ Address = {{ADDRESS}}
 PrivateKey = {{PRIVATE_KEY}}
 ListenPort = 51820
 MTU = 1420
+DNS = {{DNS}}
 
 [Peer]
 PublicKey = {{PUBLIC_KEY}}

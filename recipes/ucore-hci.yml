@@ -10,8 +10,8 @@ modules:
   - from-file: base.yml
   - type: files
     files:
-      - source: hostname/ucore-hci
-        destination: /etc
+      - source: system_ucore-hci
+        destination: /
   - type: dnf
     install:
       packages:
@@ -19,5 +19,7 @@ modules:
   - type: systemd
     system:
       enabled:
-        - firstboot-syncthing.service
         - syncthing.service
+        - wg-quick@wg0.service
+        - firstboot-syncthing.service
+        - firstboot-wireguard@wg0.service

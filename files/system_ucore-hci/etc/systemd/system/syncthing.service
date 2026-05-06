@@ -1,12 +1,12 @@
 [Unit]
 Description=Syncthing - Open Source Continuous File Synchronization
 Documentation=man:syncthing(1)
-After=network.target
+After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=4
 
 [Service]
-User=sync
+User=syncthing
 Type=exec
 ExecStart=/usr/bin/syncthing serve --no-browser --no-restart --no-default-folder --skip-port-probing --logflags=0 --data /var/srv/sync --config /etc/syncthing
 Restart=on-failure

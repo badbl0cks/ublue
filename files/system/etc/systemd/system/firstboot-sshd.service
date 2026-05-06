@@ -1,7 +1,8 @@
 [Unit]
 Description=sshd - First Boot Setup
-ConditionPathExists=/etc/ssh/.firstboot
-Before=sshd.service
+ConditionPathExists=!/etc/ssh/.firstboot
+Before=sshd.service network.target
+After=network-pre.target
 
 [Service]
 StandardOutput=journal+console

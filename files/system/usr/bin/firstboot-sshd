@@ -7,16 +7,20 @@ cd "${WD}"
 # implements sshaudit.com hardening guide recommendations for Rocky Linux 9 (closest to Fedora)
 # last update 2024: https://oam7575.github.io/ssh_hardening_guides/index.html#rocky_9
 
-if [[ -f "${WD}/.firstboot" ]]; then
+if [[ ! -f "${WD}/.firstboot" ]]; then
     # Implement connection rate throttling in order to protect against the DHEat denial-of-service attack.
-    firewall-cmd --direct --add-rule ipv4 filter INPUT 0 -p tcp --dport 22 -m state --state NEW -m recent --set --permanent > /dev/null
-    firewall-cmd --direct --add-rule ipv4 filter INPUT 1 -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP --permanent > /dev/null
-    firewall-cmd --direct --add-rule ipv6 filter INPUT 0 -p tcp --dport 22 -m state --state NEW -m recent --set --permanent > /dev/null
-    firewall-cmd --direct --add-rule ipv6 filter INPUT 1 -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP --permanent > /dev/null
+    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -p tcp --dport 24 -m state --state NEW -m recent --set > /dev/null
+    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 1 -p tcp --dport 24 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP > /dev/null
+    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 0 -p tcp --dport 24 -m state --state NEW -m recent --set > /dev/null
+    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 1 -p tcp --dport 24 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP > /dev/null
 
     # make sure the ssh service is allowed through the firewall and reload it to apply the new rules
-    firewall-cmd --add-service=ssh --permanent > /dev/null
+    firewall-cmd --permanent --add-port 24/tcp --service=ssh > /dev/null
+    firewall-cmd --permanent --add-service=ssh > /dev/null
     firewall-cmd --reload > /dev/null
+
+    # Update the SELinux policy to allow SSH to listen on the new port
+    semanage port -m -t ssh_port_t -p tcp 24 > /dev/null || semanage port -a -t ssh_port_t -p tcp 24 > /dev/null
 
     # Re-generate the RSA and ED25519 keys
     rm -f /etc/ssh/ssh_host_*
@@ -39,9 +43,8 @@ if [[ -f "${WD}/.firstboot" ]]; then
     sed -i 's/#\?\(PasswordAuthentication\s*\).*$/\1 no/' /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
     sed -i 's/#\?\(AllowTcpForwarding\s*\).*$/\1 yes/' /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
 
-    # Mark first boot script as having run by removing the .firstboot file
-    rm -f "${WD}/.firstboot"
+    touch "${WD}/.firstboot"
     echo "First boot script completed."
 else
-    echo "First boot script already run (missing .firstboot file in ${WD}). Skipping..."
+    echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
 fi
