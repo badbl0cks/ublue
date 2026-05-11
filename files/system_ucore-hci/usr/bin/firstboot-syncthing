@@ -28,6 +28,7 @@ if [[ ! -f "${WD}/.firstboot" ]]; then
 
     rm -f "${WD}/config.env"
     touch "${WD}/.firstboot"
+    chown syncthing:syncthing "${WD}/.firstboot"
     echo "First boot script completed."
 else
     echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
