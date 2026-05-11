@@ -22,6 +22,8 @@ modules:
         - syncthing.service
         - wg-quick@wg0.service
         - rpm-ostreed-automatic.timer
+        - podman.socket
+        - podman.service
         - firstboot-etc.service
         - firstboot-syncthing.service
         - firstboot-wireguard@wg0.service
