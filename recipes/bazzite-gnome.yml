@@ -31,7 +31,7 @@ modules:
       - 1460 # Vitals
       - 1160 # Dash to Panel
       - 97 # Coverflow Alt-Tab
-      - 8671 # All-in-One Clipboard
+      #- 8671 # All-in-One Clipboard
       - 7856 # Mouse Tail
       - 8971 # Lock Guard
       - 4338 # Allow Locked Remote Desktop
