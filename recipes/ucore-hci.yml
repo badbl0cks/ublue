@@ -21,5 +21,7 @@ modules:
       enabled:
         - syncthing.service
         - wg-quick@wg0.service
+        - rpm-ostreed-automatic.timer
+        - firstboot-etc.service
         - firstboot-syncthing.service
         - firstboot-wireguard@wg0.service

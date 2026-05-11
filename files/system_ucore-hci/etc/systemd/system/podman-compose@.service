@@ -1,0 +1,14 @@
+[Unit]
+Description=%i rootless pod (podman-compose)
+
+[Service]
+Type=simple
+EnvironmentFile=/var/srv/compose/%i.env
+ExecStartPre=-/usr/bin/podman-compose --in-pod pod_%i up --no-start
+ExecStartPre=/usr/bin/podman pod start pod_%i
+ExecStart=/usr/bin/podman-compose wait
+ExecStop=/usr/bin/podman pod stop pod_%i
+ExecStopPost=/usr/bin/podman pod rm pod_%i
+
+[Install]
+WantedBy=default.target
