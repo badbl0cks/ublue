@@ -31,7 +31,7 @@ modules:
         - libvirt
         - virt-manager
         - code
-        - sunshine
+        #- sunshine temp disabled
         - chromium
         - chromedriver
         - gstreamer1-plugins-ugly-free
