@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WD="/etc"
+cd "${WD}"
+
+if [[ ! -f "${WD}/.firstboot" ]]; then
+    # enable auto updates
+    sed -i 's/#\?\(AutomaticUpdatePolicy=\).*$/\1apply/' /etc/rpm-ostreed.conf
+
+    touch "${WD}/.firstboot"
+    echo "First boot script completed."
+else
+    echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
+fi
