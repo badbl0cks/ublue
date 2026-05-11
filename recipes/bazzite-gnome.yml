@@ -13,6 +13,10 @@ modules:
     files:
       - source: system_bazzite-gnome
         destination: /
+  - type: files
+    files:
+      - source: firmware
+        destination: /lib/firmware/
   - type: dnf
     install:
       packages:
