@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WD="/var"
+cd "${WD}"
+
+if [[ ! -f "${WD}/.firstboot" ]]; then
+    mkdir /var/srv /var/www
+
+    touch "${WD}/.firstboot"
+    echo "First boot script completed."
+else
+    echo "First boot script already run (.firstboot file in ${WD}). Skipping..."
+fi
