@@ -24,6 +24,7 @@ modules:
         - rpm-ostreed-automatic.timer
         - podman.socket
         - podman.service
+        - signed-autorebase.service
         - firstboot-etc.service
         - firstboot-syncthing.service
         - firstboot-wireguard@wg0.service

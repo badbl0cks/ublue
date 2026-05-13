@@ -52,12 +52,11 @@ modules:
         - samba
         - ncdu
         - terra-release
-        #- remi-release
   - type: systemd
     system:
       enabled:
         - docker.service
         - sshd.service
-        - signed-autorebase.service
         - firstboot-sshd.service
+        #
   - type: signing

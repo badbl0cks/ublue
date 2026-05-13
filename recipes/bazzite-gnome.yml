@@ -25,6 +25,10 @@ modules:
         - gtk-murrine-engine
         - gnome-boxes
         - fedora-chromium-config-gnome
+  - type: systemd
+    system:
+      enabled:
+        - signed-autorebase.service
   - type: gnome-extensions
     install:
       - 6 # Applications Menu
