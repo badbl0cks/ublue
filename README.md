@@ -36,21 +36,18 @@ installation to one of these custom builds, follow the steps below.
 > [!NOTE]
 > Be sure to replace &lt;IMAGE-NAME&gt; in the commands below with the actual image name you want to use.
 
-- First rebase to the unsigned image, in order to properly import this repository's signing keys and policies:
+- First rebase to the unsigned image, in order to properly import this repository's signing keys and policies.
   ```
   rpm-ostree rebase ostree-unverified-registry:ghcr.io/badbl0cks/<IMAGE_NAME>:latest
   ```
-- Reboot to complete the initial rebase:
+- Reboot into the new image:
   ```
   systemctl reboot
   ```
-- Then rebase to the signed image:
+- WAIT while the image boots, then automatically rebases to the signed image.
+- If this fails, either reboot and let the service try again, or run:
   ```
-  rpm-ostree rebase ostree-image-signed:docker://ghcr.io/badbl0cks/<IMAGE_NAME>:latest
-  ```
-- Reboot again to complete the signed rebase:
-  ```
-  systemctl reboot
+  rpm-ostree rebase ostree-image-signed:docker://ghcr.io/badbl0cks/<IMAGE_NAME>:latest && systemctl disable --now signed-autorebase.service && systemctl reboot
   ```
 
 ## Verification
