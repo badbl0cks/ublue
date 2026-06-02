@@ -1,0 +1,17 @@
+[Unit]
+Description=First boot - create firewalld ipsets for Hostiqo fail2ban
+ConditionPathExists=!/etc/firewalld/.firstboot-ipsets
+After=firewalld.service network-online.target
+Wants=firewalld.service network-online.target
+Before=hostiqo-distrobox.service firstboot-hostiqo.service
+
+[Service]
+StandardOutput=journal+console
+Type=oneshot
+ExecStart=/usr/bin/firstboot-firewall-ipsets
+ExecStart=/usr/bin/systemctl disable firstboot-firewall-ipsets.service
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

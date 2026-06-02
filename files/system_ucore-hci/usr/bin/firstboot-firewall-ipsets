@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Creates firewalld-managed nftables ipsets that the in-container Hostiqo
+# fail2ban writes bans into via D-Bus (firewallcmd-ipset action).
+# See plan: /home/rob/.claude/plans/let-s-explore-approach-4-snoopy-newell.md
+
+WD="/etc/firewalld"
+SENTINEL="${WD}/.firstboot-ipsets"
+
+if [[ -f "${SENTINEL}" ]]; then
+    echo "First boot script already run (${SENTINEL}). Skipping..."
+    exit 0
+fi
+
+echo "First boot detected. Creating fail2ban ipsets in firewalld..."
+
+# Wait for firewalld to be running before issuing firewall-cmd calls
+for _ in $(seq 1 30); do
+    firewall-cmd --state >/dev/null 2>&1 && break
+    sleep 1
+done
+firewall-cmd --state >/dev/null
+
+DEFAULT_ZONE=$(firewall-cmd --get-default-zone)
+echo "Default firewalld zone: ${DEFAULT_ZONE}"
+
+create_ipset() {
+    local name="$1" family="$2" timeout="$3"
+    if firewall-cmd --permanent --get-ipsets | tr ' ' '\n' | grep -qx "${name}"; then
+        echo "ipset ${name} already exists, skipping"
+        return 0
+    fi
+    firewall-cmd --permanent \
+        --new-ipset="${name}" \
+        --type=hash:ip \
+        --option=family="${family}" \
+        --option=timeout="${timeout}" >/dev/null
+    echo "Created ipset ${name} (family=${family}, timeout=${timeout}s)"
+}
+
+# 1-day timeout for general jails (nginx-*, sshd, sshd-ddos)
+create_ipset "fail2ban-default"      "inet"  "86400"
+create_ipset "fail2ban-default-ipv6" "inet6" "86400"
+
+# 1-week timeout for the recidive jail
+create_ipset "fail2ban-recidive"      "inet"  "604800"
+create_ipset "fail2ban-recidive-ipv6" "inet6" "604800"
+
+# Bind each ipset to the default zone as a drop source via a rich rule
+add_drop_rule() {
+    local ipset="$1" family="$2"
+    local rule="rule family=\"${family}\" source ipset=\"${ipset}\" drop"
+    if firewall-cmd --permanent --zone="${DEFAULT_ZONE}" --query-rich-rule="${rule}" >/dev/null 2>&1; then
+        echo "Rich rule for ipset ${ipset} already present, skipping"
+        return 0
+    fi
+    firewall-cmd --permanent --zone="${DEFAULT_ZONE}" --add-rich-rule="${rule}" >/dev/null
+    echo "Added drop rich rule for ipset ${ipset}"
+}
+
+add_drop_rule "fail2ban-default"      "ipv4"
+add_drop_rule "fail2ban-default-ipv6" "ipv6"
+add_drop_rule "fail2ban-recidive"      "ipv4"
+add_drop_rule "fail2ban-recidive-ipv6" "ipv6"
+
+# Open Hostiqo nginx ports (container shares host netns, binds host 80/443)
+firewall-cmd --permanent --add-service=http  >/dev/null
+firewall-cmd --permanent --add-service=https >/dev/null
+
+firewall-cmd --reload >/dev/null
+echo "firewalld reloaded with new ipsets and drop rules"
+
+mkdir -p "${WD}"
+touch "${SENTINEL}"
+echo "First boot script completed."

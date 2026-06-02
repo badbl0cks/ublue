@@ -1,0 +1,23 @@
+[Unit]
+Description=Hostiqo - Rocky 9 Distrobox container (panel + Laravel app)
+After=network-online.target podman.service firewalld.service firstboot-firewall-ipsets.service
+Wants=network-online.target podman.service firewalld.service
+Requires=podman.service
+
+[Service]
+StandardOutput=journal+console
+Type=simple
+# Assemble (create-if-missing) is idempotent. distrobox-assemble reads
+# /etc/distrobox/hostiqo.ini and creates the `hostiqo` container.
+ExecStartPre=/usr/bin/mkdir -p /var/lib/hostiqo
+ExecStartPre=/usr/bin/distrobox assemble create --file /etc/distrobox/hostiqo.ini
+# Start the container's init (systemd) and keep this service alive while it runs.
+# podman start -a attaches stdout/stderr so journald sees the container's boot.
+ExecStart=/usr/bin/podman start -a hostiqo
+ExecStop=/usr/bin/podman stop -t 30 hostiqo
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=First boot - bootstrap Hostiqo inside the distrobox container
+ConditionPathExists=!/var/lib/hostiqo/.firstboot
+After=hostiqo-distrobox.service firstboot-firewall-ipsets.service
+Wants=hostiqo-distrobox.service
+Requires=hostiqo-distrobox.service
+
+[Service]
+StandardOutput=journal+console
+Type=oneshot
+ExecStart=/usr/bin/firstboot-hostiqo
+ExecStart=/usr/bin/systemctl disable firstboot-hostiqo.service
+TimeoutStartSec=1800
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

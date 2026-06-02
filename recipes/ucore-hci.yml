@@ -16,6 +16,9 @@ modules:
     install:
       packages:
         - syncthing
+        - distrobox
+        - firewalld
+        - ipset
   - type: systemd
     system:
       enabled:
@@ -25,6 +28,10 @@ modules:
         - podman.socket
         - podman.service
         - signed-autorebase.service
+        - firewalld.service
         - firstboot-etc.service
         - firstboot-syncthing.service
         - firstboot-wireguard@wg0.service
+        - firstboot-firewall-ipsets.service
+        - firstboot-hostiqo.service
+        - hostiqo-distrobox.service

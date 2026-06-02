@@ -1,0 +1,3352 @@
+#!/bin/bash
+
+#########################################################
+# Hostiqo - Complete Installer
+# Server Management Made Simple
+#
+# Author: Muhammad Hamizi Jaminan
+# Website: https://hostiqo.dev
+# License: MIT + Commons Clause (see LICENSE file)
+#
+# Run with: sudo bash scripts/install.sh
+#########################################################
+
+# Note: We don't use 'set -e' to allow graceful error handling
+# Each critical command should handle its own errors
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_success() { echo -e "${GREEN}✓ $1${NC}"; }
+print_error() { echo -e "${RED}✗ $1${NC}"; }
+print_info() { echo -e "${YELLOW}→ $1${NC}"; }
+print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
+print_header() {
+    echo ""
+    echo -e "${BLUE}==========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}==========================================${NC}"
+    echo ""
+}
+
+# Read input from terminal (works with curl pipe)
+read_input() {
+    read "$@" </dev/tty || true
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "This script must be run as root or with sudo"
+        echo "Usage: sudo bash scripts/install.sh"
+        exit 1
+    fi
+}
+
+# Enable fail2ban jail
+ensure_jail() {
+    local order="$1"   # 00, 10, 20, 21
+    local jail="$2"    # sshd, nginx-botsearch, etc
+    local extra="$3"   # optional extra config
+
+    local dir="/etc/fail2ban/jail.d"
+    local file="${dir}/${order}-${jail}.local"
+
+    mkdir -p "$dir"
+
+    # Check fail2ban installed
+    command -v fail2ban-client >/dev/null 2>&1 || return 0
+
+    # Idempotent: do nothing if file already exists
+    [[ -f "$file" ]] && return 0
+
+    # Create jail config (fail2ban will validate on restart)
+    cat > "$file" <<EOF
+[$jail]
+enabled = true
+${extra}
+EOF
+    print_info "Enabled fail2ban jail: $jail"
+}
+
+# Default installation path
+DEFAULT_APP_DIR="/var/www/hostiqo"
+REPO_URL="https://github.com/hymns/hostiqo.git"
+
+# Will be set after clone/detection
+APP_DIR=""
+
+# OS Detection variables (set by detect_os)
+OS_FAMILY=""      # debian or rhel
+OS_ID=""          # ubuntu, debian, rocky, alma, centos, rhel
+OS_VERSION=""     # e.g., 22.04, 9, 8
+PKG_MANAGER=""    # apt or dnf/yum
+WEB_USER=""       # www-data or nginx
+PHP_FPM_SERVICE="" # php8.x-fpm or php-fpm
+SYSTEMCTL="/bin/systemctl"
+
+#########################################################
+# PRE-FLIGHT CHECKS
+#########################################################
+preflight_check() {
+    print_header "Pre-flight Checks"
+    
+    local errors=0
+    
+    # 1. Check internet connectivity
+    print_info "Checking internet connectivity..."
+    if curl -s --connect-timeout 10 https://google.com > /dev/null 2>&1; then
+        print_success "Internet connectivity OK"
+    elif curl -s --connect-timeout 10 https://cloudflare.com > /dev/null 2>&1; then
+        print_success "Internet connectivity OK"
+    elif wget -q --timeout=10 -O /dev/null https://google.com 2>/dev/null; then
+        print_success "Internet connectivity OK"
+    else
+        print_error "No internet connectivity. Please check your network."
+        errors=$((errors + 1))
+    fi
+    
+    # 2. Check disk space (minimum 5GB free)
+    print_info "Checking disk space..."
+    DISK_FREE=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+    if [[ -z "$DISK_FREE" ]]; then
+        DISK_FREE=$(df -k / | awk 'NR==2 {print int($4/1024/1024)}')
+    fi
+    if [[ "$DISK_FREE" -ge 5 ]] 2>/dev/null; then
+        print_success "Disk space OK (${DISK_FREE}GB free)"
+    else
+        print_error "Insufficient disk space. Need at least 5GB free (have ${DISK_FREE}GB)."
+        errors=$((errors + 1))
+    fi
+    
+    # 3. Check RAM (minimum 1GB recommended)
+    print_info "Checking memory..."
+    TOTAL_RAM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    if [[ -z "$TOTAL_RAM_MB" ]]; then
+        TOTAL_RAM_MB=$(cat /proc/meminfo | grep MemTotal | awk '{print int($2/1024)}')
+    fi
+    if [[ "$TOTAL_RAM_MB" -ge 1024 ]] 2>/dev/null; then
+        print_success "Memory OK (${TOTAL_RAM_MB}MB total)"
+    elif [[ "$TOTAL_RAM_MB" -ge 512 ]] 2>/dev/null; then
+        print_warning "Low memory (${TOTAL_RAM_MB}MB). Recommended: 1GB+. Installation may be slow."
+    else
+        print_error "Insufficient memory (${TOTAL_RAM_MB}MB). Minimum: 512MB."
+        errors=$((errors + 1))
+    fi
+    
+    # 4. Check if running in container (warning only)
+    print_info "Checking environment..."
+    if [[ -f /.dockerenv ]] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+        print_warning "Running in Docker container. Some features may not work (systemd, fail2ban)."
+    elif [[ -f /run/systemd/container ]] || systemd-detect-virt --container > /dev/null 2>&1; then
+        CONTAINER_TYPE=$(systemd-detect-virt --container 2>/dev/null || cat /run/systemd/container 2>/dev/null || echo "unknown")
+        print_warning "Running in container ($CONTAINER_TYPE). Some features may be limited."
+    else
+        print_success "Environment OK (bare metal/VM)"
+    fi
+    
+    # 5. Check systemd availability
+    print_info "Checking systemd..."
+    if command -v systemctl &> /dev/null && systemctl --version > /dev/null 2>&1; then
+        print_success "Systemd available"
+    else
+        print_error "Systemd not available. Hostiqo requires systemd for service management."
+        errors=$((errors + 1))
+    fi
+    
+    # 6. Install essential tools if missing
+    print_info "Checking essential tools..."
+    ESSENTIAL_TOOLS="curl wget"
+    MISSING_TOOLS=""
+    
+    for tool in $ESSENTIAL_TOOLS; do
+        if ! command -v $tool &> /dev/null; then
+            MISSING_TOOLS="$MISSING_TOOLS $tool"
+        fi
+    done
+    
+    if [[ -n "$MISSING_TOOLS" ]]; then
+        print_info "Installing missing tools:$MISSING_TOOLS"
+        if command -v apt-get &> /dev/null; then
+            apt-get update -y > /dev/null 2>&1
+            apt-get install -y $MISSING_TOOLS > /dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y $MISSING_TOOLS > /dev/null 2>&1
+        elif command -v yum &> /dev/null; then
+            yum install -y $MISSING_TOOLS > /dev/null 2>&1
+        fi
+        
+        # Verify installation
+        for tool in $MISSING_TOOLS; do
+            if command -v $tool &> /dev/null; then
+                print_success "$tool installed"
+            else
+                print_error "Failed to install $tool"
+                errors=$((errors + 1))
+            fi
+        done
+    else
+        print_success "Essential tools available (curl, wget)"
+    fi
+    
+    # 7. Check GPG for repository keys
+    print_info "Checking GPG..."
+    if command -v gpg &> /dev/null; then
+        print_success "GPG available"
+    else
+        print_info "Installing GPG..."
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y gnupg2 > /dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y gnupg2 > /dev/null 2>&1
+        elif command -v yum &> /dev/null; then
+            yum install -y gnupg2 > /dev/null 2>&1
+        fi
+        
+        if command -v gpg &> /dev/null; then
+            print_success "GPG installed"
+        else
+            print_error "Failed to install GPG. Repository key verification may fail."
+            errors=$((errors + 1))
+        fi
+    fi
+    
+    # 8. Check if ports 80/443 are available
+    print_info "Checking port availability..."
+    PORTS_IN_USE=""
+    if command -v ss &> /dev/null; then
+        ss -tlnp 2>/dev/null | grep -q ':80 ' && PORTS_IN_USE="$PORTS_IN_USE 80"
+        ss -tlnp 2>/dev/null | grep -q ':443 ' && PORTS_IN_USE="$PORTS_IN_USE 443"
+    elif command -v netstat &> /dev/null; then
+        netstat -tlnp 2>/dev/null | grep -q ':80 ' && PORTS_IN_USE="$PORTS_IN_USE 80"
+        netstat -tlnp 2>/dev/null | grep -q ':443 ' && PORTS_IN_USE="$PORTS_IN_USE 443"
+    fi
+    
+    if [[ -n "$PORTS_IN_USE" ]]; then
+        print_warning "Ports in use:$PORTS_IN_USE. Existing web server will be replaced."
+    else
+        print_success "Ports 80/443 available"
+    fi
+    
+    echo ""
+    
+    # Final verdict
+    if [[ $errors -gt 0 ]]; then
+        print_error "Pre-flight checks failed with $errors error(s). Please fix the issues above."
+        exit 1
+    fi
+    
+    print_success "All pre-flight checks passed!"
+    echo ""
+}
+
+#########################################################
+# OS DETECTION
+#########################################################
+detect_os() {
+    print_info "Detecting operating system..."
+
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
+    else
+        print_error "Cannot detect OS. /etc/os-release not found."
+        exit 1
+    fi
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            OS_FAMILY="debian"
+            PKG_MANAGER="apt"
+            WEB_USER="www-data"
+            ;;
+        rocky|almalinux|centos|rhel)
+            OS_FAMILY="rhel"
+            WEB_USER="nginx"
+            # Use dnf if available, fallback to yum
+            if command -v dnf &> /dev/null; then
+                PKG_MANAGER="dnf"
+            else
+                PKG_MANAGER="yum"
+            fi
+            ;;
+        *)
+            print_error "Unsupported OS: $OS_ID"
+            print_info "Supported: Ubuntu, Debian, Rocky Linux, AlmaLinux, CentOS, RHEL"
+            exit 1
+            ;;
+    esac
+
+    print_success "Detected: $OS_ID $OS_VERSION ($OS_FAMILY family)"
+    print_info "Package manager: $PKG_MANAGER"
+    print_info "Web user: $WEB_USER"
+}
+
+#########################################################
+# PHASE 1: System Prerequisites
+#########################################################
+install_prerequisites() {
+    print_header "Phase 1: Installing System Prerequisites"
+    
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        install_prerequisites_debian
+    else
+        install_prerequisites_rhel
+    fi
+
+    # Common post-installation tasks
+    install_common_tools
+    configure_security
+    
+    # Set ownership of app directory (now that web user exists)
+    if [[ -d "$APP_DIR" ]]; then
+        print_info "Setting ownership of $APP_DIR to $WEB_USER..."
+        chown -R $WEB_USER:$WEB_USER "$APP_DIR"
+        print_success "Ownership set to $WEB_USER"
+    fi
+
+    print_success "Phase 1 completed!"
+}
+
+#########################################################
+# DEBIAN/UBUNTU Prerequisites
+#########################################################
+install_prerequisites_debian() {
+    # Set non-interactive mode to avoid prompts
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Update system
+    print_info "Updating system packages..."
+    apt-get update -y > /dev/null 2>&1
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" > /dev/null 2>&1
+    print_success "System updated"
+    
+    # Install basic dependencies
+    print_info "Installing basic dependencies..."
+    apt-get install -y software-properties-common apt-transport-https ca-certificates \
+        curl wget git net-tools unzip build-essential gnupg2 lsb-release > /dev/null 2>&1
+    print_success "Basic dependencies installed"
+    
+    # Add official Nginx repository
+    print_info "Adding official Nginx repository..."
+    curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg > /dev/null 2>&1
+    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
+    apt-get update -y > /dev/null 2>&1
+    print_success "Nginx repository added"
+    
+    # Install Nginx
+    print_info "Installing Nginx from official repository..."
+    apt-get install -y nginx > /dev/null 2>&1
+    systemctl enable nginx > /dev/null 2>&1
+    systemctl start nginx > /dev/null 2>&1
+    print_success "Nginx installed and started"
+    
+    # Configure nginx for Debian-style sites-available/sites-enabled
+    print_info "Configuring Nginx directories and user..."
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
+    mkdir -p /etc/nginx/snippets
+    
+    # Create fastcgi.conf if not exists
+    if [[ ! -f /etc/nginx/fastcgi.conf ]]; then
+        cat > /etc/nginx/fastcgi.conf << 'FASTCGICONFEOF'
+fastcgi_param  SCRIPT_FILENAME    $document_root$fastcgi_script_name;
+fastcgi_param  QUERY_STRING       $query_string;
+fastcgi_param  REQUEST_METHOD     $request_method;
+fastcgi_param  CONTENT_TYPE       $content_type;
+fastcgi_param  CONTENT_LENGTH     $content_length;
+
+fastcgi_param  SCRIPT_NAME        $fastcgi_script_name;
+fastcgi_param  REQUEST_URI        $request_uri;
+fastcgi_param  DOCUMENT_URI       $document_uri;
+fastcgi_param  DOCUMENT_ROOT      $document_root;
+fastcgi_param  SERVER_PROTOCOL    $server_protocol;
+fastcgi_param  REQUEST_SCHEME     $scheme;
+fastcgi_param  HTTPS              $https if_not_empty;
+
+fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
+
+fastcgi_param  REMOTE_ADDR        $remote_addr;
+fastcgi_param  REMOTE_PORT        $remote_port;
+fastcgi_param  SERVER_ADDR        $server_addr;
+fastcgi_param  SERVER_PORT        $server_port;
+fastcgi_param  SERVER_NAME        $server_name;
+
+# PHP only, required if PHP was built with --enable-force-cgi-redirect
+fastcgi_param  REDIRECT_STATUS    200;
+FASTCGICONFEOF
+    fi
+    
+    # Create fastcgi-php.conf snippet
+    cat > /etc/nginx/snippets/fastcgi-php.conf << 'FASTCGIEOF'
+# regex to split $uri to $fastcgi_script_name and $fastcgi_path_info
+fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+
+# Check that the PHP script exists before passing it
+try_files $fastcgi_script_name =404;
+
+# Bypass the fact that try_files resets $fastcgi_path_info
+set $path_info $fastcgi_path_info;
+fastcgi_param PATH_INFO $path_info;
+
+fastcgi_index index.php;
+include fastcgi.conf;
+FASTCGIEOF
+    
+    # ==============================================
+    # Dynamic Nginx Tuning based on CPU/RAM
+    # ==============================================
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    CPU_CORES=$(nproc)
+    
+    # worker_processes = CPU cores (auto is also good)
+    NGINX_WORKERS=$CPU_CORES
+    
+    # worker_connections based on RAM (each connection ~1KB)
+    # Formula: (RAM_MB * 256) / workers, min 512, max 4096
+    WORKER_CONNECTIONS=$((TOTAL_RAM_MB * 256 / NGINX_WORKERS))
+    [[ $WORKER_CONNECTIONS -lt 512 ]] && WORKER_CONNECTIONS=512
+    [[ $WORKER_CONNECTIONS -gt 4096 ]] && WORKER_CONNECTIONS=4096
+    
+    # Client body buffer based on RAM
+    if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        CLIENT_BODY_BUFFER="128k"
+        CLIENT_MAX_BODY="512M"
+    elif [[ $TOTAL_RAM_MB -ge 2048 ]]; then
+        CLIENT_BODY_BUFFER="64k"
+        CLIENT_MAX_BODY="256M"
+    else
+        CLIENT_BODY_BUFFER="32k"
+        CLIENT_MAX_BODY="128M"
+    fi
+    
+    print_info "Nginx tuning: ${NGINX_WORKERS} workers, ${WORKER_CONNECTIONS} connections, ${CLIENT_MAX_BODY} max body"
+    
+    # Backup original nginx.conf before replacing
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+    
+    # Create optimized nginx.conf
+    cat > /etc/nginx/nginx.conf << NGINXCONF
+# Hostiqo Nginx Configuration
+# Auto-tuned for ${TOTAL_RAM_MB}MB RAM, ${CPU_CORES} CPU cores
+# Generated on: $(date)
+
+user www-data;
+worker_processes ${NGINX_WORKERS};
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+# Worker settings
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections ${WORKER_CONNECTIONS};
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    # Basic Settings
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
+    
+    # MIME types
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    
+    # Logging
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    
+    # Gzip Compression
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/xml application/xml+rss text/javascript application/x-javascript image/svg+xml;
+    
+    # Buffer Settings
+    client_body_buffer_size ${CLIENT_BODY_BUFFER};
+    client_max_body_size ${CLIENT_MAX_BODY};
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 16k;
+    
+    # Timeouts
+    client_body_timeout 60;
+    client_header_timeout 60;
+    send_timeout 60;
+    
+    # Open file cache
+    open_file_cache max=10000 inactive=30s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # SSL Session Cache (global)
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1440m;
+    
+    # Include configs
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+NGINXCONF
+    
+    # Test nginx configuration
+    if nginx -t > /dev/null 2>&1; then
+        print_success "Nginx configured with dynamic tuning"
+        systemctl reload nginx > /dev/null 2>&1 || true
+        rm -f /etc/nginx/nginx.conf.backup
+    else
+        print_error "Nginx config test failed! Rolling back..."
+        cp /etc/nginx/nginx.conf.backup /etc/nginx/nginx.conf
+        nginx -t
+        print_warning "Restored original nginx.conf"
+    fi
+    
+    # Create logrotate config for nginx (nginx.org package may not include it)
+    if [[ ! -f /etc/logrotate.d/nginx ]]; then
+        print_info "Creating logrotate config for Nginx..."
+        cat > /etc/logrotate.d/nginx << 'LOGROTATEEOF'
+/var/log/nginx/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        [[ -f /var/run/nginx.pid ]] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+LOGROTATEEOF
+        print_success "Logrotate config created"
+    fi
+    
+    # Configure rate limiting with Cloudflare IP allowlist
+    print_info "Configuring Nginx rate limiting with Cloudflare IP allowlist..."
+    mkdir -p /etc/nginx/conf.d
+    
+    # Create rate limiting configuration
+    cat > /etc/nginx/conf.d/rate-limit.conf << 'RATELIMITEOF'
+# Rate Limiting Zone - 10MB zone can store ~160k IP addresses
+# Limit: 10 requests per second per IP (burst of 20)
+limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+
+# Cloudflare IP allowlist - bypass rate limiting for Cloudflare IPs
+geo $cloudflare_ip {
+    default 0;
+    
+    # Cloudflare IPv4 ranges
+    173.245.48.0/20 1;
+    103.21.244.0/22 1;
+    103.22.200.0/22 1;
+    103.31.4.0/22 1;
+    141.101.64.0/18 1;
+    108.162.192.0/18 1;
+    190.93.240.0/20 1;
+    188.114.96.0/20 1;
+    197.234.240.0/22 1;
+    198.41.128.0/17 1;
+    162.158.0.0/15 1;
+    104.16.0.0/13 1;
+    104.24.0.0/14 1;
+    172.64.0.0/13 1;
+    131.0.72.0/22 1;
+    
+    # Cloudflare IPv6 ranges
+    2400:cb00::/32 1;
+    2606:4700::/32 1;
+    2803:f800::/32 1;
+    2405:b500::/32 1;
+    2405:8100::/32 1;
+    2a06:98c0::/29 1;
+    2c0f:f248::/32 1;
+}
+
+# Map to determine if rate limiting should be applied
+map $cloudflare_ip $limit_key {
+    0 $binary_remote_addr;  # Apply rate limiting
+    1 "";                   # Bypass rate limiting for Cloudflare
+}
+
+# Rate limiting zone using the mapped key
+limit_req_zone $limit_key zone=cloudflare_bypass:10m rate=10r/s;
+RATELIMITEOF
+    
+    print_success "Nginx rate limiting configured with Cloudflare IP allowlist"
+    
+    # Add PHP repository
+    print_info "Adding PHP repository..."
+    add-apt-repository -y ppa:ondrej/php > /dev/null 2>&1
+    apt-get update -y > /dev/null 2>&1
+    print_success "PHP repository added"
+    
+    # Install whiptail if not available
+    if ! command -v whiptail &> /dev/null; then
+        apt-get install -y whiptail > /dev/null 2>&1
+    fi
+    
+    # PHP version selection with whiptail
+    print_info "Select PHP versions to install..."
+    PHP_SELECTIONS=$(whiptail --title "PHP Version Selection" --checklist \
+        "Select PHP versions to install (use SPACE to select, ENTER to confirm):" 18 60 6 \
+        "7.4" "PHP 7.4 (Legacy)" OFF \
+        "8.0" "PHP 8.0" OFF \
+        "8.1" "PHP 8.1" OFF \
+        "8.2" "PHP 8.2 (Recommended)" ON \
+        "8.3" "PHP 8.3 (Latest Stable)" ON \
+        "8.4" "PHP 8.4 (Cutting Edge)" OFF \
+        3>&1 1>&2 2>&3)
+    
+    # Check if user cancelled
+    if [[ $? -ne 0 ]] || [[ -z "$PHP_SELECTIONS" ]]; then
+        print_warning "No PHP version selected, defaulting to PHP 8.2 and 8.3"
+        PHP_SELECTIONS='"8.2" "8.3"'
+    fi
+    
+    # Convert selections to array (remove quotes)
+    PHP_VERSIONS=$(echo "$PHP_SELECTIONS" | tr -d '"')
+    
+    # Install selected PHP versions
+    print_info "Installing PHP versions: $PHP_VERSIONS"
+    for version in $PHP_VERSIONS; do
+        print_info "Installing PHP $version..."
+        apt-get install -y \
+            php${version}-fpm \
+            php${version}-cli \
+            php${version}-common \
+            php${version}-mysql \
+            php${version}-pgsql \
+            php${version}-sqlite3 \
+            php${version}-zip \
+            php${version}-gd \
+            php${version}-mbstring \
+            php${version}-curl \
+            php${version}-xml \
+            php${version}-bcmath \
+            php${version}-intl \
+            php${version}-redis > /dev/null 2>&1
+        systemctl enable php${version}-fpm > /dev/null 2>&1
+        systemctl start php${version}-fpm > /dev/null 2>&1
+        print_success "PHP $version installed"
+    done
+    
+    # Save installed PHP versions to config
+    mkdir -p /etc/hostiqo
+    PHP_JSON_ARRAY=$(echo "$PHP_VERSIONS" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd ',' | sed 's/^/[/;s/$/]/')
+    echo "{\"php_versions\": $PHP_JSON_ARRAY}" > /etc/hostiqo/config.json
+    chmod 644 /etc/hostiqo/config.json
+    print_success "PHP versions saved to /etc/hostiqo/config.json"
+    
+    # Configure PHP
+    print_info "Configuring PHP..."
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    CPU_CORES=$(nproc)
+    
+    # ==============================================
+    # Dynamic PHP Settings based on RAM
+    # ==============================================
+    
+    # OPcache memory (12.5% of RAM, min 128M, max 512M)
+    OPCACHE_MEM=$((TOTAL_RAM_MB / 8))
+    [[ $OPCACHE_MEM -lt 128 ]] && OPCACHE_MEM=128
+    [[ $OPCACHE_MEM -gt 512 ]] && OPCACHE_MEM=512
+    
+    # JIT buffer (25% of OPcache, min 32M)
+    JIT_BUFFER=$((OPCACHE_MEM / 4))
+    [[ $JIT_BUFFER -lt 32 ]] && JIT_BUFFER=32
+    
+    # Interned strings buffer
+    if [[ $TOTAL_RAM_MB -ge 8192 ]]; then
+        INTERNED_STRINGS=64
+    elif [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        INTERNED_STRINGS=32
+    else
+        INTERNED_STRINGS=16
+    fi
+    
+    # Memory limit per script
+    if [[ $TOTAL_RAM_MB -ge 8192 ]]; then
+        PHP_MEMORY_LIMIT=512
+    elif [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        PHP_MEMORY_LIMIT=256
+    elif [[ $TOTAL_RAM_MB -ge 2048 ]]; then
+        PHP_MEMORY_LIMIT=192
+    else
+        PHP_MEMORY_LIMIT=128
+    fi
+    
+    # Execution time
+    if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        MAX_EXECUTION_TIME=300
+        MAX_INPUT_TIME=300
+    else
+        MAX_EXECUTION_TIME=120
+        MAX_INPUT_TIME=120
+    fi
+    
+    # Upload/POST size
+    if [[ $TOTAL_RAM_MB -ge 8192 ]]; then
+        UPLOAD_MAX=512
+        POST_MAX=512
+    elif [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        UPLOAD_MAX=256
+        POST_MAX=256
+    elif [[ $TOTAL_RAM_MB -ge 2048 ]]; then
+        UPLOAD_MAX=128
+        POST_MAX=128
+    else
+        UPLOAD_MAX=64
+        POST_MAX=64
+    fi
+    
+    # Max input vars
+    if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        MAX_INPUT_VARS=5000
+    else
+        MAX_INPUT_VARS=3000
+    fi
+    
+    # Realpath cache
+    if [[ $TOTAL_RAM_MB -ge 8192 ]]; then
+        REALPATH_CACHE_SIZE=16M
+    elif [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        REALPATH_CACHE_SIZE=8M
+    else
+        REALPATH_CACHE_SIZE=4M
+    fi
+    
+    # PHP-FPM pool settings (for default www pool)
+    # max_children = Available RAM / ~50MB per process (conservative)
+    PHP_FPM_MAX_CHILDREN=$((TOTAL_RAM_MB / 100))
+    [[ $PHP_FPM_MAX_CHILDREN -lt 5 ]] && PHP_FPM_MAX_CHILDREN=5
+    [[ $PHP_FPM_MAX_CHILDREN -gt 100 ]] && PHP_FPM_MAX_CHILDREN=100
+    
+    PHP_FPM_START_SERVERS=$((PHP_FPM_MAX_CHILDREN / 4))
+    [[ $PHP_FPM_START_SERVERS -lt 2 ]] && PHP_FPM_START_SERVERS=2
+    
+    PHP_FPM_MIN_SPARE=$((PHP_FPM_MAX_CHILDREN / 10))
+    [[ $PHP_FPM_MIN_SPARE -lt 1 ]] && PHP_FPM_MIN_SPARE=1
+    
+    PHP_FPM_MAX_SPARE=$((PHP_FPM_MAX_CHILDREN / 4))
+    [[ $PHP_FPM_MAX_SPARE -lt 3 ]] && PHP_FPM_MAX_SPARE=3
+    
+    print_info "PHP tuning: ${PHP_MEMORY_LIMIT}M memory, ${UPLOAD_MAX}M upload, ${PHP_FPM_MAX_CHILDREN} max workers"
+    
+    # Create PHP error log directory
+    mkdir -p /var/log/php
+    chown www-data:www-data /var/log/php
+    
+    for version in $PHP_VERSIONS; do
+        if [[ -d "/etc/php/$version" ]]; then
+            # ==============================================
+            # OPcache + JIT Configuration
+            # ==============================================
+            cat > "/etc/php/$version/mods-available/opcache-hostiqo.ini" << OPCACHE
+[opcache]
+; Hostiqo PHP OPcache + JIT Tuning
+; Auto-calculated based on ${TOTAL_RAM_MB}MB total RAM, ${CPU_CORES} CPU cores
+; Generated on: $(date)
+
+; Enable OPcache
+opcache.enable=1
+opcache.enable_cli=0
+
+; Memory settings
+opcache.memory_consumption=${OPCACHE_MEM}
+opcache.interned_strings_buffer=${INTERNED_STRINGS}
+opcache.max_accelerated_files=20000
+
+; Revalidation (production-ready)
+opcache.validate_timestamps=1
+opcache.revalidate_freq=60
+
+; Performance optimizations
+opcache.enable_file_override=1
+opcache.save_comments=1
+opcache.max_wasted_percentage=10
+opcache.fast_shutdown=1
+OPCACHE
+            # Add JIT for PHP 8.0+
+            if [[ "$version" =~ ^8\. ]]; then
+                cat >> "/etc/php/$version/mods-available/opcache-hostiqo.ini" << OPCACHE
+
+; JIT (PHP 8.0+) - significant performance boost
+opcache.jit=1255
+opcache.jit_buffer_size=${JIT_BUFFER}M
+OPCACHE
+            fi
+            
+            # ==============================================
+            # PHP.ini Tuning Configuration
+            # ==============================================
+            cat > "/etc/php/$version/mods-available/hostiqo-tuning.ini" << PHPINI
+; Hostiqo PHP Tuning
+; Auto-calculated based on ${TOTAL_RAM_MB}MB total RAM
+; Generated on: $(date)
+
+; ==============================================
+; Memory
+; ==============================================
+memory_limit = ${PHP_MEMORY_LIMIT}M
+
+; ==============================================
+; Execution & Timeout
+; ==============================================
+max_execution_time = ${MAX_EXECUTION_TIME}
+max_input_time = ${MAX_INPUT_TIME}
+default_socket_timeout = 60
+
+; ==============================================
+; Upload & POST
+; ==============================================
+upload_max_filesize = ${UPLOAD_MAX}M
+post_max_size = ${POST_MAX}M
+max_file_uploads = 20
+max_input_vars = ${MAX_INPUT_VARS}
+
+; ==============================================
+; Path & Realpath Cache
+; ==============================================
+realpath_cache_size = ${REALPATH_CACHE_SIZE}
+realpath_cache_ttl = 600
+
+; ==============================================
+; Session
+; ==============================================
+session.gc_maxlifetime = 1440
+session.save_handler = files
+session.save_path = /var/lib/php/sessions
+
+; ==============================================
+; Security (Production)
+; ==============================================
+expose_php = Off
+display_errors = Off
+display_startup_errors = Off
+log_errors = On
+error_log = /var/log/php/php${version}-error.log
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+allow_url_fopen = On
+allow_url_include = Off
+enable_dl = Off
+
+; ==============================================
+; Misc
+; ==============================================
+date.timezone = UTC
+PHPINI
+
+            # ==============================================
+            # PHP-FPM Default Pool Tuning
+            # ==============================================
+            cat > "/etc/php/$version/fpm/pool.d/www-hostiqo.conf" << FPMPOOL
+; Hostiqo PHP-FPM Pool Tuning (overrides www.conf defaults)
+; Auto-calculated based on ${TOTAL_RAM_MB}MB total RAM
+; Generated on: $(date)
+
+[www]
+; Process manager
+pm = dynamic
+pm.max_children = ${PHP_FPM_MAX_CHILDREN}
+pm.start_servers = ${PHP_FPM_START_SERVERS}
+pm.min_spare_servers = ${PHP_FPM_MIN_SPARE}
+pm.max_spare_servers = ${PHP_FPM_MAX_SPARE}
+pm.max_requests = 500
+
+; Timeouts
+request_terminate_timeout = ${MAX_EXECUTION_TIME}s
+request_slowlog_timeout = 5s
+
+; Logging
+slowlog = /var/log/php/php${version}-fpm-slow.log
+catch_workers_output = yes
+decorate_workers_output = no
+
+; Security
+php_admin_flag[log_errors] = on
+php_admin_value[error_log] = /var/log/php/php${version}-fpm-error.log
+FPMPOOL
+
+            # Enable the configs
+            ln -sf "/etc/php/$version/mods-available/opcache-hostiqo.ini" "/etc/php/$version/fpm/conf.d/99-opcache-hostiqo.ini" 2>/dev/null || true
+            ln -sf "/etc/php/$version/mods-available/opcache-hostiqo.ini" "/etc/php/$version/cli/conf.d/99-opcache-hostiqo.ini" 2>/dev/null || true
+            ln -sf "/etc/php/$version/mods-available/hostiqo-tuning.ini" "/etc/php/$version/fpm/conf.d/99-hostiqo-tuning.ini" 2>/dev/null || true
+            ln -sf "/etc/php/$version/mods-available/hostiqo-tuning.ini" "/etc/php/$version/cli/conf.d/99-hostiqo-tuning.ini" 2>/dev/null || true
+            
+            # Restart PHP-FPM to apply changes
+            systemctl restart php${version}-fpm > /dev/null 2>&1 || true
+        fi
+    done
+    print_success "PHP OPcache + JIT + Tuning configured"
+    
+    # Node.js version selection with whiptail
+    print_info "Select Node.js version to install..."
+    NODE_VERSION=$(whiptail --title "Node.js Version Selection" --radiolist \
+        "Select Node.js LTS version to install:" 12 60 3 \
+        "20" "Node.js 20 LTS (Recommended)" ON \
+        "22" "Node.js 22 LTS" OFF \
+        "24" "Node.js 24 LTS (Latest)" OFF \
+        3>&1 1>&2 2>&3)
+    
+    # Default to 20 if cancelled
+    if [[ $? -ne 0 ]] || [[ -z "$NODE_VERSION" ]]; then
+        print_warning "No Node.js version selected, defaulting to Node.js 20"
+        NODE_VERSION="20"
+    fi
+    
+    # Install Node.js
+    print_info "Adding NodeSource repository for Node.js ${NODE_VERSION}..."
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - > /dev/null 2>&1
+    print_info "Installing Node.js ${NODE_VERSION}..."
+    apt-get install -y nodejs > /dev/null 2>&1
+    print_success "Node.js $(node -v) installed"
+    
+    # Update config.json with Node.js version
+    if [[ -f /etc/hostiqo/config.json ]]; then
+        # Add node_version to existing config
+        TMP_CONFIG=$(mktemp)
+        cat /etc/hostiqo/config.json | sed 's/}$/,"node_version":"'"${NODE_VERSION}"'"}/' > "$TMP_CONFIG"
+        mv "$TMP_CONFIG" /etc/hostiqo/config.json
+        chmod 644 /etc/hostiqo/config.json
+    fi
+    
+    # Install Redis
+    print_info "Installing Redis..."
+    apt-get install -y redis-server > /dev/null 2>&1
+    systemctl enable redis-server > /dev/null 2>&1
+    systemctl start redis-server > /dev/null 2>&1
+    print_success "Redis installed and started"
+    
+    # Install MySQL
+    print_info "Installing MySQL..."
+    apt-get install -y mysql-server > /dev/null 2>&1
+    systemctl enable mysql > /dev/null 2>&1
+    systemctl start mysql > /dev/null 2>&1
+    print_success "MySQL installed and started"
+    
+    # Install Certbot
+    print_info "Installing Certbot..."
+    apt-get install -y certbot > /dev/null 2>&1
+    print_success "Certbot installed"
+    
+    # Install Supervisor
+    print_info "Installing Supervisor..."
+    apt-get install -y supervisor > /dev/null 2>&1
+    systemctl enable supervisor > /dev/null 2>&1
+    systemctl start supervisor > /dev/null 2>&1
+    print_success "Supervisor installed and started"
+    
+    # Install fail2ban
+    print_info "Installing fail2ban..."
+    apt-get install -y fail2ban > /dev/null 2>&1
+    print_success "fail2ban installed"
+    
+    # Install and configure logrotate
+    print_info "Installing logrotate..."
+    apt-get install -y logrotate > /dev/null 2>&1
+    print_success "logrotate installed"
+    
+    print_info "Configuring logrotate for Hostiqo..."
+    cat > /etc/logrotate.d/hostiqo << 'LOGROTATE_EOF'
+# Hostiqo Log Rotation Configuration
+# Keep logs for 7 days, max 100MB per file
+
+/var/log/nginx/hostiqo-*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        [[ -f /var/run/nginx.pid ]] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+
+/var/www/hostiqo/storage/logs/*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+
+/var/log/php*-fpm/*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/php/php-fpm-socket-helper install /run/php/php-fpm.sock /etc/php/*/fpm/pool.d/www.conf 70 || true
+    endscript
+}
+LOGROTATE_EOF
+    print_success "logrotate configured for Hostiqo"
+    
+    # Configure log rotation for system logs
+    print_info "Configuring logrotate for system logs..."
+    cat > /etc/logrotate.d/rsyslog << 'LOGROTATE'
+/var/log/syslog
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+{
+        rotate 7
+        daily
+        maxsize 100M
+        missingok
+        notifempty
+        compress
+        delaycompress
+        sharedscripts
+        postrotate
+                /usr/lib/rsyslog/rsyslog-rotate
+        endscript
+}
+LOGROTATE
+    print_success "System log rotation configured"
+
+    # Create web directories
+    print_info "Creating web directories..."
+    mkdir -p /var/www
+    chown -R www-data:www-data /var/www
+    chmod -R 755 /var/www
+    print_success "Web directories created"
+}
+
+#########################################################
+# RHEL/Rocky/Alma/CentOS Prerequisites
+#########################################################
+install_prerequisites_rhel() {
+    # Update system
+    print_info "Updating system packages..."
+    $PKG_MANAGER update -y > /dev/null 2>&1
+    print_success "System updated"
+
+    # Install EPEL repository
+    print_info "Installing EPEL repository..."
+    $PKG_MANAGER install -y epel-release > /dev/null 2>&1
+    print_success "EPEL repository installed"
+
+    # Install basic dependencies (openssl MUST be first for secure_database)
+    print_info "Installing basic dependencies..."
+    $PKG_MANAGER install -y openssl > /dev/null 2>&1 || true
+    $PKG_MANAGER install -y ca-certificates curl wget git net-tools unzip \
+        gcc gcc-c++ make gnupg2 openssl-devel > /dev/null 2>&1
+    print_success "Basic dependencies installed"
+
+    # Add official Nginx repository
+    print_info "Adding official Nginx repository..."
+    cat > /etc/yum.repos.d/nginx.repo << 'NGINXREPO'
+[nginx-stable]
+name=nginx stable repo
+baseurl=http://nginx.org/packages/centos/$releasever/$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+module_hotfixes=true
+NGINXREPO
+    print_success "Nginx repository added"
+
+    # Install Nginx
+    print_info "Installing Nginx from official repository..."
+    $PKG_MANAGER install -y nginx > /dev/null 2>&1
+    systemctl enable nginx > /dev/null 2>&1
+    systemctl start nginx > /dev/null 2>&1
+    print_success "Nginx installed and started"
+    
+    # Configure nginx for sites-available/sites-enabled style (like Debian)
+    print_info "Configuring Nginx directories and user..."
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
+    
+    # ==============================================
+    # Dynamic Nginx Tuning based on CPU/RAM
+    # ==============================================
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    CPU_CORES=$(nproc)
+    
+    # worker_processes = CPU cores
+    NGINX_WORKERS=$CPU_CORES
+    
+    # worker_connections based on RAM
+    WORKER_CONNECTIONS=$((TOTAL_RAM_MB * 256 / NGINX_WORKERS))
+    [[ $WORKER_CONNECTIONS -lt 512 ]] && WORKER_CONNECTIONS=512
+    [[ $WORKER_CONNECTIONS -gt 4096 ]] && WORKER_CONNECTIONS=4096
+    
+    # Client body buffer based on RAM
+    if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        CLIENT_BODY_BUFFER="128k"
+        CLIENT_MAX_BODY="512M"
+    elif [[ $TOTAL_RAM_MB -ge 2048 ]]; then
+        CLIENT_BODY_BUFFER="64k"
+        CLIENT_MAX_BODY="256M"
+    else
+        CLIENT_BODY_BUFFER="32k"
+        CLIENT_MAX_BODY="128M"
+    fi
+    
+    print_info "Nginx tuning: ${NGINX_WORKERS} workers, ${WORKER_CONNECTIONS} connections, ${CLIENT_MAX_BODY} max body"
+    
+    # Backup original nginx.conf before replacing
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+    
+    # Create optimized nginx.conf
+    cat > /etc/nginx/nginx.conf << NGINXCONF
+# Hostiqo Nginx Configuration
+# Auto-tuned for ${TOTAL_RAM_MB}MB RAM, ${CPU_CORES} CPU cores
+# Generated on: $(date)
+
+user nginx;
+worker_processes ${NGINX_WORKERS};
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+# Worker settings
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections ${WORKER_CONNECTIONS};
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    # Basic Settings
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
+    
+    # MIME types
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    
+    # Logging
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    
+    # Gzip Compression
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/xml application/xml+rss text/javascript application/x-javascript image/svg+xml;
+    
+    # Buffer Settings
+    client_body_buffer_size ${CLIENT_BODY_BUFFER};
+    client_max_body_size ${CLIENT_MAX_BODY};
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 16k;
+    
+    # Timeouts
+    client_body_timeout 60;
+    client_header_timeout 60;
+    send_timeout 60;
+    
+    # Open file cache
+    open_file_cache max=10000 inactive=30s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # SSL Session Cache (global)
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1440m;
+    
+    # Include configs
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+NGINXCONF
+    
+    # Test nginx configuration
+    if nginx -t > /dev/null 2>&1; then
+        print_success "Nginx configured with dynamic tuning"
+        systemctl reload nginx > /dev/null 2>&1 || true
+        rm -f /etc/nginx/nginx.conf.backup
+    else
+        print_error "Nginx config test failed! Rolling back..."
+        cp /etc/nginx/nginx.conf.backup /etc/nginx/nginx.conf
+        nginx -t
+        print_warning "Restored original nginx.conf"
+    fi
+    
+    # Create logrotate config for nginx (nginx.org package may not include it)
+    if [[ ! -f /etc/logrotate.d/nginx ]]; then
+        print_info "Creating logrotate config for Nginx..."
+        cat > /etc/logrotate.d/nginx << 'LOGROTATEEOF'
+/var/log/nginx/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 nginx adm
+    sharedscripts
+    postrotate
+        [[ -f /var/run/nginx.pid ]] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+LOGROTATEEOF
+        print_success "Logrotate config created"
+    fi
+    
+    # Configure rate limiting with Cloudflare IP allowlist
+    print_info "Configuring Nginx rate limiting with Cloudflare IP allowlist..."
+    mkdir -p /etc/nginx/conf.d
+    
+    # Create rate limiting configuration
+    cat > /etc/nginx/conf.d/rate-limit.conf << 'RATELIMITEOF'
+# Rate Limiting Zone - 10MB zone can store ~160k IP addresses
+# Limit: 10 requests per second per IP (burst of 20)
+limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+
+# Cloudflare IP allowlist - bypass rate limiting for Cloudflare IPs
+geo $cloudflare_ip {
+    default 0;
+    
+    # Cloudflare IPv4 ranges
+    173.245.48.0/20 1;
+    103.21.244.0/22 1;
+    103.22.200.0/22 1;
+    103.31.4.0/22 1;
+    141.101.64.0/18 1;
+    108.162.192.0/18 1;
+    190.93.240.0/20 1;
+    188.114.96.0/20 1;
+    197.234.240.0/22 1;
+    198.41.128.0/17 1;
+    162.158.0.0/15 1;
+    104.16.0.0/13 1;
+    104.24.0.0/14 1;
+    172.64.0.0/13 1;
+    131.0.72.0/22 1;
+    
+    # Cloudflare IPv6 ranges
+    2400:cb00::/32 1;
+    2606:4700::/32 1;
+    2803:f800::/32 1;
+    2405:b500::/32 1;
+    2405:8100::/32 1;
+    2a06:98c0::/29 1;
+    2c0f:f248::/32 1;
+}
+
+# Map to determine if rate limiting should be applied
+map $cloudflare_ip $limit_key {
+    0 $binary_remote_addr;  # Apply rate limiting
+    1 "";                   # Bypass rate limiting for Cloudflare
+}
+
+# Rate limiting zone using the mapped key
+limit_req_zone $limit_key zone=cloudflare_bypass:10m rate=10r/s;
+RATELIMITEOF
+    
+    print_success "Nginx rate limiting configured with Cloudflare IP allowlist"
+
+    # Add Remi repository for PHP
+    print_info "Adding Remi repository for PHP..."
+    if [[ "$OS_ID" = "centos" ]] && [[ "${OS_VERSION%%.*}" = "7" ]]; then
+        $PKG_MANAGER install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm > /dev/null 2>&1
+    else
+        # Rocky 8/9, Alma 8/9, RHEL 8/9, CentOS Stream
+        $PKG_MANAGER install -y https://rpms.remirepo.net/enterprise/remi-release-${OS_VERSION%%.*}.rpm > /dev/null 2>&1
+    fi
+    print_success "Remi repository added"
+
+    # Enable Remi PHP module
+    print_info "Enabling PHP module..."
+    if command -v dnf &> /dev/null; then
+        dnf module reset php -y > /dev/null 2>&1 || true
+    fi
+    
+    # Install newt for whiptail if not available
+    if ! command -v whiptail &> /dev/null; then
+        $PKG_MANAGER install -y newt > /dev/null 2>&1
+    fi
+    
+    # PHP version selection with whiptail
+    print_info "Select PHP versions to install..."
+    PHP_SELECTIONS=$(whiptail --title "PHP Version Selection" --checklist \
+        "Select PHP versions to install (use SPACE to select, ENTER to confirm):" 18 60 6 \
+        "74" "PHP 7.4 (Legacy)" OFF \
+        "80" "PHP 8.0" OFF \
+        "81" "PHP 8.1" OFF \
+        "82" "PHP 8.2 (Recommended)" ON \
+        "83" "PHP 8.3 (Latest Stable)" ON \
+        "84" "PHP 8.4 (Cutting Edge)" OFF \
+        3>&1 1>&2 2>&3)
+    
+    # Check if user cancelled
+    if [[ $? -ne 0 ]] || [[ -z "$PHP_SELECTIONS" ]]; then
+        print_warning "No PHP version selected, defaulting to PHP 8.2 and 8.3"
+        PHP_SELECTIONS='"82" "83"'
+    fi
+    
+    # Convert selections to array (remove quotes)
+    PHP_VERSIONS_NODOT=$(echo "$PHP_SELECTIONS" | tr -d '"')
+    
+    # Install selected PHP versions
+    print_info "Installing selected PHP versions..."
+    for version in $PHP_VERSIONS_NODOT; do
+        version_dot="${version:0:1}.${version:1}"
+        print_info "Installing PHP $version_dot..."
+        $PKG_MANAGER install -y \
+            php${version}-php-fpm \
+            php${version}-php-cli \
+            php${version}-php-common \
+            php${version}-php-mysqlnd \
+            php${version}-php-pgsql \
+            php${version}-php-pdo \
+            php${version}-php-zip \
+            php${version}-php-gd \
+            php${version}-php-mbstring \
+            php${version}-php-curl \
+            php${version}-php-xml \
+            php${version}-php-bcmath \
+            php${version}-php-intl \
+            php${version}-php-redis \
+            php${version}-php-opcache > /dev/null 2>&1
+
+        # Configure PHP-FPM to use nginx user for socket
+        FPM_CONF="/etc/opt/remi/php${version}/php-fpm.d/www.conf"
+        if [[ -f "$FPM_CONF" ]]; then
+            sed -i 's/^user = .*/user = nginx/' "$FPM_CONF"
+            sed -i 's/^group = .*/group = nginx/' "$FPM_CONF"
+            sed -i 's/^;listen.owner = .*/listen.owner = nginx/' "$FPM_CONF"
+            sed -i 's/^;listen.group = .*/listen.group = nginx/' "$FPM_CONF"
+            sed -i 's/^listen.owner = .*/listen.owner = nginx/' "$FPM_CONF"
+            sed -i 's/^listen.group = .*/listen.group = nginx/' "$FPM_CONF"
+            # Disable ACL users (overrides owner/group settings)
+            sed -i 's/^listen.acl_users = .*/;listen.acl_users = /' "$FPM_CONF"
+        fi
+
+        # Enable and start PHP-FPM service
+        systemctl enable php${version}-php-fpm > /dev/null 2>&1
+        systemctl start php${version}-php-fpm > /dev/null 2>&1
+        print_success "PHP $version_dot installed"
+    done
+    
+    # Save installed PHP versions to config (convert 82 -> 8.2 format)
+    mkdir -p /etc/hostiqo
+    PHP_JSON_ARRAY=$(echo "$PHP_VERSIONS_NODOT" | tr ' ' '\n' | while read v; do echo "\"${v:0:1}.${v:1}\""; done | paste -sd ',' | sed 's/^/[/;s/$/]/')
+    echo "{\"php_versions\": $PHP_JSON_ARRAY}" > /etc/hostiqo/config.json
+    chmod 644 /etc/hostiqo/config.json
+    print_success "PHP versions saved to /etc/hostiqo/config.json"
+
+    # Create symlink for default PHP (use highest installed version)
+    HIGHEST_PHP=$(echo "$PHP_VERSIONS_NODOT" | tr ' ' '\n' | sort -rn | head -1)
+    if [[ ! -f /usr/bin/php ]] && [[ -n "$HIGHEST_PHP" ]]; then
+        ln -sf /opt/remi/php${HIGHEST_PHP}/root/usr/bin/php /usr/bin/php
+    fi
+
+    # Configure PHP OPcache + JIT
+    print_info "Configuring PHP..."
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    OPCACHE_MEM=$((TOTAL_RAM_MB / 8))
+    [[ $OPCACHE_MEM -lt 128 ]] && OPCACHE_MEM=128
+    [[ $OPCACHE_MEM -gt 512 ]] && OPCACHE_MEM=512
+    JIT_BUFFER=$((OPCACHE_MEM / 4))
+    [[ $JIT_BUFFER -lt 32 ]] && JIT_BUFFER=32
+    
+    for version in $PHP_VERSIONS_NODOT; do
+        version_dot="${version:0:1}.${version:1}"
+        REMI_PHP_DIR="/etc/opt/remi/php${version}"
+        if [[ -d "$REMI_PHP_DIR" ]]; then
+            cat > "$REMI_PHP_DIR/php.d/99-opcache-hostiqo.ini" << OPCACHE
+[opcache]
+; Hostiqo PHP OPcache + JIT Tuning
+; Auto-calculated based on ${TOTAL_RAM_MB}MB total RAM
+
+; Enable OPcache
+opcache.enable=1
+opcache.enable_cli=1
+
+; Memory settings
+opcache.memory_consumption=${OPCACHE_MEM}
+opcache.interned_strings_buffer=32
+opcache.max_accelerated_files=20000
+
+; Revalidation (production-ready)
+opcache.validate_timestamps=1
+opcache.revalidate_freq=60
+
+; Performance optimizations
+opcache.enable_file_override=1
+opcache.save_comments=1
+opcache.max_wasted_percentage=10
+OPCACHE
+            # Add JIT for PHP 8.0+
+            if [[ "$version" =~ ^8 ]]; then
+                cat >> "$REMI_PHP_DIR/php.d/99-opcache-hostiqo.ini" << OPCACHE
+
+; JIT (PHP 8.0+) - significant performance boost
+opcache.jit=1255
+opcache.jit_buffer_size=${JIT_BUFFER}M
+OPCACHE
+            fi
+        fi
+    done
+    print_success "PHP OPcache + JIT configured"
+
+    # Node.js version selection with whiptail
+    print_info "Select Node.js version to install..."
+    NODE_VERSION=$(whiptail --title "Node.js Version Selection" --radiolist \
+        "Select Node.js LTS version to install:" 12 60 3 \
+        "20" "Node.js 20 LTS (Recommended)" ON \
+        "22" "Node.js 22 LTS" OFF \
+        "24" "Node.js 24 LTS (Latest)" OFF \
+        3>&1 1>&2 2>&3)
+    
+    # Default to 20 if cancelled
+    if [[ $? -ne 0 ]] || [[ -z "$NODE_VERSION" ]]; then
+        print_warning "No Node.js version selected, defaulting to Node.js 20"
+        NODE_VERSION="20"
+    fi
+    
+    # Install Node.js
+    print_info "Adding NodeSource repository for Node.js ${NODE_VERSION}..."
+    curl -fsSL https://rpm.nodesource.com/setup_${NODE_VERSION}.x | bash - > /dev/null 2>&1
+    print_info "Installing Node.js ${NODE_VERSION}..."
+    $PKG_MANAGER install -y nodejs > /dev/null 2>&1
+    print_success "Node.js $(node -v) installed"
+    
+    # Update config.json with Node.js version
+    if [[ -f /etc/hostiqo/config.json ]]; then
+        # Add node_version to existing config
+        TMP_CONFIG=$(mktemp)
+        cat /etc/hostiqo/config.json | sed 's/}$/,"node_version":"'"${NODE_VERSION}"'"}/' > "$TMP_CONFIG"
+        mv "$TMP_CONFIG" /etc/hostiqo/config.json
+        chmod 644 /etc/hostiqo/config.json
+    fi
+
+    # Install Redis
+    print_info "Installing Redis..."
+    if command -v dnf &> /dev/null; then
+        dnf module enable redis:7 -y > /dev/null 2>&1 || true
+    fi
+    $PKG_MANAGER install -y redis > /dev/null 2>&1 || {
+        print_warning "Redis package not found, trying redis6..."
+        $PKG_MANAGER install -y redis6 > /dev/null 2>&1 || true
+    }
+    systemctl enable redis > /dev/null 2>&1 || true
+    systemctl start redis > /dev/null 2>&1 || true
+    print_success "Redis installed and started"
+
+    # Install MySQL/MariaDB
+    print_info "Installing MariaDB..."
+    $PKG_MANAGER install -y mariadb-server mariadb > /dev/null 2>&1 || {
+        print_error "Failed to install MariaDB"
+        exit 1
+    }
+    systemctl enable mariadb > /dev/null 2>&1 || true
+    systemctl start mariadb > /dev/null 2>&1 || true
+    print_success "MariaDB installed and started"
+
+    # Install Certbot
+    print_info "Installing Certbot..."
+    $PKG_MANAGER install -y certbot > /dev/null 2>&1
+    print_success "Certbot installed"
+
+    # Install Supervisor
+    print_info "Installing Supervisor..."
+    $PKG_MANAGER install -y supervisor > /dev/null 2>&1 || {
+        print_error "Failed to install Supervisor"
+        exit 1
+    }
+    systemctl enable supervisord > /dev/null 2>&1 || true
+    systemctl start supervisord > /dev/null 2>&1 || true
+    print_success "Supervisor installed and started"
+
+    # Install fail2ban
+    print_info "Installing fail2ban..."
+    $PKG_MANAGER install -y fail2ban > /dev/null 2>&1
+    print_success "fail2ban installed"
+    
+    # Install and configure logrotate
+    print_info "Installing logrotate..."
+    $PKG_MANAGER install -y logrotate > /dev/null 2>&1
+    print_success "logrotate installed"
+    
+    print_info "Configuring logrotate for Hostiqo..."
+    cat > /etc/logrotate.d/hostiqo << 'LOGROTATE_EOF'
+# Hostiqo Log Rotation Configuration
+# Keep logs for 7 days, max 100MB per file
+
+/var/log/nginx/hostiqo-*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        [[ -f /var/run/nginx.pid ]] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+
+/var/www/hostiqo/storage/logs/*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+
+/var/opt/remi/php*/log/php-fpm/*.log {
+    daily
+    maxage 7
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /bin/systemctl reload php*-php-fpm > /dev/null 2>&1 || true
+    endscript
+}
+LOGROTATE_EOF
+    print_success "logrotate configured for Hostiqo"
+    
+    # Configure log rotation for system logs
+    print_info "Configuring logrotate for system logs..."
+    cat > /etc/logrotate.d/rsyslog << 'LOGROTATE'
+/var/log/syslog
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+{
+        rotate 7
+        daily
+        maxsize 100M
+        missingok
+        notifempty
+        compress
+        delaycompress
+        sharedscripts
+        postrotate
+                /usr/lib/rsyslog/rsyslog-rotate
+        endscript
+}
+LOGROTATE
+    print_success "System log rotation configured"
+
+    # Create web directories
+    print_info "Creating web directories..."
+    mkdir -p /var/www
+    chown -R nginx:nginx /var/www
+    chmod -R 755 /var/www
+    print_success "Web directories created"
+
+    # Configure SELinux for web
+    print_info "Configuring SELinux..."
+    if command -v getenforce &> /dev/null; then
+        # Set SELinux to permissive mode for Hostiqo compatibility
+        # httpd_t context has issues with sudo/PAM when enforcing
+        sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true
+        setenforce 0 2>/dev/null || true
+        print_success "SELinux set to permissive mode"
+    fi
+}
+
+#########################################################
+# Common Tools Installation
+#########################################################
+install_common_tools() {
+    # Install Composer (install to /usr/bin for better sudo compatibility)
+    print_info "Installing Composer..."
+    cd /tmp
+    EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
+    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
+    
+    if [[ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]]; then
+        print_warning "Composer installer checksum mismatch, trying direct download..."
+        curl -sS https://getcomposer.org/download/latest-stable/composer.phar -o composer.phar
+    else
+        php composer-setup.php --quiet
+        rm -f composer-setup.php
+    fi
+    
+    if [[ -f composer.phar ]]; then
+        mv composer.phar /usr/local/bin/composer
+        chmod +x /usr/local/bin/composer
+        # Create symlink in /usr/bin for sudo access
+        ln -sf /usr/local/bin/composer /usr/bin/composer 2>/dev/null || true
+        print_success "Composer installed"
+    else
+        print_warning "Failed to install Composer, please install manually later"
+    fi
+
+    # Install PM2
+    print_info "Installing PM2..."
+    npm install -g pm2 > /dev/null 2>&1
+    pm2 startup systemd > /dev/null 2>&1 || true
+    print_success "PM2 installed"
+    
+    # Install WP-CLI
+    print_info "Installing WP-CLI..."
+    if ! command -v wp &> /dev/null; then
+        curl -sS https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar 2>/dev/null
+        if [[ -f /tmp/wp-cli.phar ]]; then
+            chmod +x /tmp/wp-cli.phar
+            mv /tmp/wp-cli.phar /usr/local/bin/wp
+            print_success "WP-CLI installed"
+        fi
+    else
+        print_success "WP-CLI already installed"
+    fi
+    
+    # Create PM2 config directory
+    mkdir -p /etc/pm2
+    chmod 755 /etc/pm2
+}
+
+#########################################################
+# Security Configuration
+#########################################################
+configure_security() {
+    print_header "Security Hardening"
+    
+    # Kernel parameter hardening for DDoS protection
+    print_info "Configuring kernel parameters for DDoS protection..."
+    sysctl -w net.ipv4.tcp_syncookies=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=1 > /dev/null 2>&1
+    
+    # Make sysctl changes persistent
+    cat >> /etc/sysctl.conf << 'SYSCTLEOF'
+
+# DDoS Protection
+net.ipv4.tcp_syncookies=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.rp_filter=1
+SYSCTLEOF
+    print_success "Kernel parameters configured for DDoS protection"
+    
+    # Configure fail2ban
+    print_info "Configuring fail2ban defaults..."
+    if [[ -f /etc/fail2ban/jail.conf ]]; then
+        # Create jail.local with DEFAULT settings only
+        cat > /etc/fail2ban/jail.local << 'JAILEOF'
+[DEFAULT]
+# Ban hosts for 24 hours (86400 seconds)
+bantime = 86400
+
+# Find time window (10 minutes)
+findtime = 600
+
+# Max retry attempts before ban
+maxretry = 3
+
+# Ban action
+banaction = iptables-multiport
+
+# Ignore local IPs
+ignoreip = 127.0.0.1/8
+
+# Destination email for notifications (optional)
+destemail = root@localhost
+
+# Sender email
+sender = fail2ban@localhost
+
+# Action to take when banning
+action = %(action_mwl)s
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+findtime = 60
+bantime = 604800
+
+[sshd-ddos]
+enabled = true
+port = ssh
+filter = sshd-ddos
+maxretry = 6
+findtime = 60
+bantime = 3600
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+filter = nginx-http-auth
+logpath = /var/log/nginx/*access.log
+maxretry = 5
+bantime = 86400
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+filter = nginx-botsearch
+logpath = /var/log/nginx/*access.log
+maxretry = 2
+bantime = 86400
+
+[nginx-bad-request]
+enabled = true
+port = http,https
+filter = nginx-bad-request
+logpath = /var/log/nginx/*access.log
+maxretry = 10
+bantime = 86400
+
+[nginx-4xx]
+enabled = true
+port = http,https
+filter = nginx-4xx
+logpath = /var/log/nginx/*access.log
+maxretry = 20
+findtime = 60
+bantime = 86400
+
+[recidive]
+enabled = true
+filter = recidive
+logpath = /var/log/fail2ban.log
+action = iptables-allports
+bantime = 2592000
+findtime = 86400
+maxretry = 3
+JAILEOF
+        
+        # Create custom nginx-4xx filter
+        print_info "Creating nginx-4xx filter..."
+        cat > /etc/fail2ban/filter.d/nginx-4xx.conf << 'FILTEREOF'
+# Fail2Ban filter to match 4xx errors in nginx access log
+# Blocks IPs that generate too many 4xx errors (404, 403, etc.)
+
+[Definition]
+failregex = ^<HOST> - .* "(GET|POST|HEAD|PUT|DELETE).*" (400|401|403|404|405|444) .*$
+ignoreregex = .*(robots\.txt|favicon\.ico).*
+FILTEREOF
+        
+        # Enable recommended jails for web hosting
+        ensure_jail 10 sshd
+        ensure_jail 20 nginx-botsearch
+        ensure_jail 21 nginx-http-auth
+        ensure_jail 22 nginx-limit-req
+        ensure_jail 23 nginx-bad-request
+        ensure_jail 24 nginx-4xx "logpath = /var/log/nginx/*access.log
+maxretry = 20
+findtime = 60
+bantime = 1d"
+        ensure_jail 30 mysqld-auth
+        ensure_jail 40 recidive "bantime = 1m
+findtime = 1d"
+    fi
+    systemctl enable fail2ban > /dev/null 2>&1
+    systemctl restart fail2ban > /dev/null 2>&1
+    print_success "fail2ban configured and enabled"
+
+    # Configure firewall based on OS
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        configure_ufw
+    else
+        configure_firewalld
+    fi
+    
+    # Secure MySQL/MariaDB
+    secure_database
+    
+    # Tune MySQL/MariaDB performance based on server resources
+    tune_database
+}
+
+#########################################################
+# UFW Firewall (Debian/Ubuntu)
+#########################################################
+configure_ufw() {
+    print_info "Configuring UFW firewall..."
+    if command -v ufw &> /dev/null; then
+        ufw --force enable > /dev/null 2>&1
+        ufw default deny incoming > /dev/null 2>&1
+        ufw default allow outgoing > /dev/null 2>&1
+        ufw allow ssh > /dev/null 2>&1
+        ufw allow 80/tcp > /dev/null 2>&1
+        ufw allow 443/tcp > /dev/null 2>&1
+        print_success "UFW firewall configured (SSH, HTTP, HTTPS)"
+    fi
+}
+
+#########################################################
+# Firewalld (RHEL/Rocky/Alma/CentOS)
+#########################################################
+configure_firewalld() {
+    print_info "Configuring firewalld..."
+    if command -v firewall-cmd &> /dev/null; then
+        systemctl enable firewalld > /dev/null 2>&1
+        systemctl start firewalld > /dev/null 2>&1
+        firewall-cmd --permanent --add-service=http > /dev/null 2>&1
+        firewall-cmd --permanent --add-service=https > /dev/null 2>&1
+        firewall-cmd --permanent --add-service=ssh > /dev/null 2>&1
+        firewall-cmd --reload > /dev/null 2>&1
+        print_success "firewalld configured"
+    fi
+}
+
+#########################################################
+# Secure Database
+#########################################################
+secure_database() {
+    print_info "Securing database installation..."
+    MYSQL_ROOT_PASS=$(openssl rand -base64 32)
+
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        mysql --user=root <<_EOF_ > /dev/null 2>&1 || true
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+FLUSH PRIVILEGES;
+_EOF_
+    else
+        # MariaDB on RHEL-based systems uses unix_socket by default
+        # We need to set password and switch to mysql_native_password
+        mysql --user=root <<_EOF_ > /dev/null 2>&1 || true
+-- Update root authentication to use password
+ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('${MYSQL_ROOT_PASS}');
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+FLUSH PRIVILEGES;
+_EOF_
+        
+        # If ALTER USER fails, try alternative method for older MariaDB
+        if ! mysql --user=root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1" > /dev/null 2>&1; then
+            mysql --user=root <<_EOF_ > /dev/null 2>&1 || true
+UPDATE mysql.user SET Password=PASSWORD('${MYSQL_ROOT_PASS}'), plugin='mysql_native_password' WHERE User='root' AND Host='localhost';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+FLUSH PRIVILEGES;
+_EOF_
+        fi
+    fi
+    
+    echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
+    chmod 600 /root/.mysql_root_password
+    print_success "Database secured (root password: /root/.mysql_root_password)"
+}
+
+#########################################################
+# MySQL/MariaDB Performance Tuning (Dynamic based on RAM/CPU)
+#########################################################
+tune_database() {
+    print_info "Tuning database performance based on server resources..."
+    
+    # Detect system resources
+    TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+    TOTAL_RAM_GB=$((TOTAL_RAM_MB / 1024))
+    CPU_CORES=$(nproc)
+    
+    print_info "Detected: ${TOTAL_RAM_MB}MB RAM, ${CPU_CORES} CPU cores"
+    
+    # Calculate InnoDB buffer pool size (25% of RAM, min 128M, max 70% RAM)
+    BUFFER_POOL_MB=$((TOTAL_RAM_MB * 25 / 100))
+    [[ $BUFFER_POOL_MB -lt 128 ]] && BUFFER_POOL_MB=128
+    MAX_BUFFER_MB=$((TOTAL_RAM_MB * 80 / 100))
+    [[ $BUFFER_POOL_MB -gt $MAX_BUFFER_MB ]] && BUFFER_POOL_MB=$MAX_BUFFER_MB
+    
+    # Buffer pool instances (power of 2: 1, 2, 4, 8 based on buffer pool size)
+    if [[ $BUFFER_POOL_MB -ge 8192 ]]; then
+        BUFFER_POOL_INSTANCES=8
+    elif [[ $BUFFER_POOL_MB -ge 4096 ]]; then
+        BUFFER_POOL_INSTANCES=4
+    elif [[ $BUFFER_POOL_MB -ge 2048 ]]; then
+        BUFFER_POOL_INSTANCES=2
+    else
+        BUFFER_POOL_INSTANCES=1
+    fi
+    
+    # InnoDB log file size (25% of buffer pool, min 48M, max 2G)
+    LOG_FILE_MB=$((BUFFER_POOL_MB * 25 / 100))
+    [[ $LOG_FILE_MB -lt 48 ]] && LOG_FILE_MB=48
+    [[ $LOG_FILE_MB -gt 2048 ]] && LOG_FILE_MB=2048
+    
+    # InnoDB log buffer size (based on RAM)
+    if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        LOG_BUFFER_MB=64
+    elif [[ $TOTAL_RAM_MB -ge 2048 ]]; then
+        LOG_BUFFER_MB=32
+    else
+        LOG_BUFFER_MB=16
+    fi
+    
+    # Temp table size (2% of RAM, min 32M, max 256M)
+    TMP_TABLE_MB=$((TOTAL_RAM_MB * 2 / 100))
+    [[ $TMP_TABLE_MB -lt 32 ]] && TMP_TABLE_MB=32
+    [[ $TMP_TABLE_MB -gt 256 ]] && TMP_TABLE_MB=256
+    
+    # Max connections (conservative: 50 + RAM_GB * 10, cap at 300)
+    # Higher values can spike RAM due to per-connection buffers
+    MAX_CONNECTIONS=$((50 + TOTAL_RAM_GB * 10))
+    [[ $MAX_CONNECTIONS -lt 50 ]] && MAX_CONNECTIONS=50
+    [[ $MAX_CONNECTIONS -gt 300 ]] && MAX_CONNECTIONS=300
+    
+    # Thread cache size (CPU cores * 2, min 8, max 64)
+    THREAD_CACHE=$((CPU_CORES * 2))
+    [[ $THREAD_CACHE -lt 8 ]] && THREAD_CACHE=8
+    [[ $THREAD_CACHE -gt 64 ]] && THREAD_CACHE=64
+    
+    # IO threads (based on CPU cores, min 2, max 8)
+    IO_THREADS=$CPU_CORES
+    [[ $IO_THREADS -lt 2 ]] && IO_THREADS=2
+    [[ $IO_THREADS -gt 8 ]] && IO_THREADS=8
+    
+    # Detect if SSD or HDD for IO capacity
+    ROOT_DISK=$(df / | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//' | sed 's/p$//')
+    ROOT_DISK_NAME=$(basename "$ROOT_DISK")
+    if [[ -f "/sys/block/${ROOT_DISK_NAME}/queue/rotational" ]]; then
+        IS_SSD=$(cat "/sys/block/${ROOT_DISK_NAME}/queue/rotational")
+        if [[ "$IS_SSD" = "0" ]]; then
+            IO_CAPACITY=1000
+            IO_CAPACITY_MAX=2000
+        else
+            IO_CAPACITY=200
+            IO_CAPACITY_MAX=400
+        fi
+    else
+        # Default to HDD values if can't detect
+        IO_CAPACITY=200
+        IO_CAPACITY_MAX=400
+    fi
+    
+    # Join/Sort buffer (per-connection, keep conservative to avoid RAM spikes)
+    # These are allocated per-connection, so lower is safer for high connection counts
+    # Using KB for all to keep consistent output format
+    if [[ $TOTAL_RAM_MB -ge 8192 ]]; then
+        SORT_BUFFER_KB=2048
+        JOIN_BUFFER_KB=2048
+        READ_BUFFER_KB=512
+    elif [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+        SORT_BUFFER_KB=1024
+        JOIN_BUFFER_KB=1024
+        READ_BUFFER_KB=256
+    else
+        # Default conservative values (256KB each)
+        SORT_BUFFER_KB=256
+        JOIN_BUFFER_KB=256
+        READ_BUFFER_KB=128
+    fi
+    
+    # Key buffer for MyISAM (small, mainly for system tables)
+    KEY_BUFFER_MB=$((TOTAL_RAM_MB * 2 / 100))
+    [[ $KEY_BUFFER_MB -lt 16 ]] && KEY_BUFFER_MB=16
+    [[ $KEY_BUFFER_MB -gt 128 ]] && KEY_BUFFER_MB=128
+    
+    # Determine config file location
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        MYSQL_CONF_DIR="/etc/mysql/mysql.conf.d"
+        mkdir -p "$MYSQL_CONF_DIR"
+        MYSQL_CONF_FILE="$MYSQL_CONF_DIR/hostiqo-tuning.cnf"
+    else
+        MYSQL_CONF_DIR="/etc/my.cnf.d"
+        mkdir -p "$MYSQL_CONF_DIR"
+        MYSQL_CONF_FILE="$MYSQL_CONF_DIR/hostiqo-tuning.cnf"
+    fi
+    
+    # Create slow query log directory
+    mkdir -p /var/log/mysql
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        chown mysql:mysql /var/log/mysql
+    else
+        chown mysql:mysql /var/log/mysql
+    fi
+    
+    # Write tuning configuration
+    cat > "$MYSQL_CONF_FILE" << MYSQLCONF
+# Hostiqo MySQL/MariaDB Performance Tuning
+# Auto-generated based on server resources: ${TOTAL_RAM_MB}MB RAM, ${CPU_CORES} CPU cores
+# Generated on: $(date)
+
+[mysqld]
+# ==============================================
+# Memory & Buffer Settings
+# ==============================================
+innodb_buffer_pool_size = ${BUFFER_POOL_MB}M
+innodb_buffer_pool_instances = ${BUFFER_POOL_INSTANCES}
+innodb_log_buffer_size = ${LOG_BUFFER_MB}M
+key_buffer_size = ${KEY_BUFFER_MB}M
+tmp_table_size = ${TMP_TABLE_MB}M
+max_heap_table_size = ${TMP_TABLE_MB}M
+
+# ==============================================
+# InnoDB Settings
+# ==============================================
+innodb_file_per_table = ON
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+innodb_log_file_size = ${LOG_FILE_MB}M
+innodb_read_io_threads = ${IO_THREADS}
+innodb_write_io_threads = ${IO_THREADS}
+innodb_io_capacity = ${IO_CAPACITY}
+innodb_io_capacity_max = ${IO_CAPACITY_MAX}
+
+# ==============================================
+# Connection Settings
+# ==============================================
+max_connections = ${MAX_CONNECTIONS}
+max_connect_errors = 100000
+wait_timeout = 600
+interactive_timeout = 600
+thread_cache_size = ${THREAD_CACHE}
+table_open_cache = 2000
+table_definition_cache = 1400
+
+# ==============================================
+# Query & Execution
+# ==============================================
+join_buffer_size = ${JOIN_BUFFER_KB}K
+sort_buffer_size = ${SORT_BUFFER_KB}K
+read_buffer_size = ${READ_BUFFER_KB}K
+read_rnd_buffer_size = ${READ_BUFFER_KB}K
+
+# ==============================================
+# Logging & Monitoring
+# ==============================================
+slow_query_log = ON
+slow_query_log_file = /var/log/mysql/slow.log
+long_query_time = 2
+log_queries_not_using_indexes = ON
+
+# ==============================================
+# Character Set & Collation
+# ==============================================
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+
+# ==============================================
+# Security
+# ==============================================
+local_infile = OFF
+symbolic-links = 0
+MYSQLCONF
+
+    print_success "Database tuning applied: ${BUFFER_POOL_MB}M buffer pool, ${MAX_CONNECTIONS} max connections, IO capacity ${IO_CAPACITY}"
+    
+    # Restart database to apply changes
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        systemctl restart mysql > /dev/null 2>&1 || true
+    else
+        systemctl restart mariadb > /dev/null 2>&1 || true
+    fi
+    
+    print_success "Database restarted with new tuning configuration"
+}
+
+#########################################################
+# PHASE 2: Sudoers Configuration
+#########################################################
+
+# Debian/Ubuntu sudoers configuration
+configure_sudoers_debian() {
+    cat > "$SUDOERS_FILE" << 'DEBIAN_EOF'
+# Hostiqo - Automated Management Permissions (Debian/Ubuntu)
+# Web server user: www-data
+
+# Nginx Management
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/nginx -t
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start nginx
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop nginx
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload nginx
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart nginx
+
+# Certbot - SSL Certificate Management
+www-data ALL=(ALL) NOPASSWD: /usr/bin/certbot
+www-data ALL=(ALL) NOPASSWD: /snap/bin/certbot
+www-data ALL=(ALL) NOPASSWD: /usr/bin/test -f /etc/letsencrypt/live/*/fullchain.pem
+www-data ALL=(ALL) NOPASSWD: /usr/bin/test -f /etc/letsencrypt/live/*/privkey.pem
+
+# PHP-FPM Pool Management
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start php*-fpm
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop php*-fpm
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload php*-fpm
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart php*-fpm
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/php-fpm* -t
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/php-fpm* -t *
+
+# File Management - PHP-FPM Pool Config Files
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/[a-zA-Z0-9._-]* /etc/php/[78].[0-9]*/fpm/pool.d/[a-zA-Z0-9._-]*.conf
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/php/[78].[0-9]*/fpm/pool.d/[a-zA-Z0-9._-]*.conf
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/php/[78].[0-9]*/fpm/pool.d/[a-zA-Z0-9._-]*.conf
+
+# File Management - Nginx Config Files (sites-available)
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/[a-zA-Z0-9._-]* /etc/nginx/sites-available/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/nginx/sites-available/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/ln -sf /etc/nginx/sites-available/[a-zA-Z0-9._-]* /etc/nginx/sites-enabled/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/sites-available/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/sites-enabled/[a-zA-Z0-9._-]*
+
+# File Management - Nginx Config Files (conf.d)
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/[a-zA-Z0-9._-]* /etc/nginx/conf.d/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/nginx/conf.d/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/conf.d/[a-zA-Z0-9._-]*
+
+# Webroot Directory Management
+www-data ALL=(ALL) NOPASSWD: /bin/mkdir -p /var/www/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/mkdir -p /var/www/[a-zA-Z0-9._-]*/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chown -R [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/www/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chown [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/www/[a-zA-Z0-9._-]*/*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod -R [0-9]* /var/www/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod [0-9]* /var/www/[a-zA-Z0-9._-]*/*
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/* /var/www/[a-zA-Z0-9._-]*/*
+www-data ALL=(ALL) NOPASSWD: /bin/mv /tmp/* /var/www/[a-zA-Z0-9._-]*/*
+www-data ALL=(ALL) NOPASSWD: /bin/rm -rf /var/www/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /usr/bin/find /var/www/[a-zA-Z0-9._-]* *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/test -d /var/www/*
+www-data ALL=(ALL) NOPASSWD: /usr/bin/test -f /var/www/*/*
+
+# Nginx Cache Directory
+www-data ALL=(ALL) NOPASSWD: /bin/mkdir -p /var/cache/nginx/*
+www-data ALL=(ALL) NOPASSWD: /bin/chown -R [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/cache/nginx/*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod -R [0-9]* /var/cache/nginx/*
+
+# PHP-FPM Log Directory
+www-data ALL=(ALL) NOPASSWD: /bin/mkdir -p /var/log/php*-fpm
+www-data ALL=(ALL) NOPASSWD: /bin/chown [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/log/php*-fpm
+
+# PM2 Process Control
+www-data ALL=(ALL) NOPASSWD: /usr/bin/pm2
+www-data ALL=(ALL) NOPASSWD: /usr/local/bin/pm2
+www-data ALL=(ALL) NOPASSWD: /bin/mkdir -p /etc/pm2
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/[a-zA-Z0-9._-]* /etc/pm2/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/pm2/[a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/pm2/[a-zA-Z0-9._-]*
+
+# Supervisor - Process Manager
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/hostiqo-*.conf /etc/supervisor/conf.d/*.conf
+www-data ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/hostiqo-*.conf /etc/supervisor/conf.d/*.conf
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/supervisor/conf.d/*.conf
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/supervisor/conf.d/*.conf
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl reread
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl update
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl start *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl stop *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl restart *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl status
+www-data ALL=(ALL) NOPASSWD: /usr/bin/tail -n * /var/log/supervisor/*.log
+
+# Systemd Service File Management
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/[a-zA-Z0-9._-]* /etc/systemd/system/[a-zA-Z0-9._-]*.service
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/systemd/system/[a-zA-Z0-9._-]*.service
+www-data ALL=(ALL) NOPASSWD: /bin/rm -f /etc/systemd/system/[a-zA-Z0-9._-]*.service
+
+# Systemd Service Control
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl daemon-reload
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl enable [a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl disable [a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start [a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop [a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart [a-zA-Z0-9._-]*
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload [a-zA-Z0-9._-]*
+
+# Service Management
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl status *
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl is-active *
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl is-enabled *
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start supervisor
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop supervisor
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart supervisor
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload supervisor
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start redis-server
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop redis-server
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart redis-server
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start mysql
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop mysql
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart mysql
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start mariadb
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop mariadb
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart mariadb
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start fail2ban
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop fail2ban
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart fail2ban
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload fail2ban
+
+# Fail2ban Client Management
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client status
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client status *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client set * banip *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client set * unbanip *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client start *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client stop *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client reload
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * ignoreip
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * bantime
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * maxretry
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * findtime
+www-data ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client banned
+www-data ALL=(ALL) NOPASSWD: /bin/cat /etc/fail2ban/jail.local
+www-data ALL=(ALL) NOPASSWD: /bin/cp /tmp/jail.local /etc/fail2ban/jail.local
+www-data ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/fail2ban/jail.local
+
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start ufw
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop ufw
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart ufw
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl enable ufw
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl disable ufw
+
+# Journal logs
+www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u * -n * --no-pager
+
+# Git
+www-data ALL=(ALL) NOPASSWD: /usr/bin/git
+
+# UFW Firewall
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/ufw
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/ufw *
+
+# Crontab
+www-data ALL=(ALL) NOPASSWD: /usr/bin/crontab
+www-data ALL=(ALL) NOPASSWD: /usr/bin/crontab *
+
+# Log File Access
+www-data ALL=(ALL) NOPASSWD: /usr/bin/tail -n * /var/log/*
+www-data ALL=(ALL) NOPASSWD: /usr/bin/tail /var/log/*
+www-data ALL=(ALL) NOPASSWD: /usr/bin/cat /var/log/*
+www-data ALL=(ALL) NOPASSWD: /usr/bin/truncate -s 0 *
+DEBIAN_EOF
+}
+
+# RHEL/Rocky/Alma sudoers configuration
+configure_sudoers_rhel() {
+    cat > "$SUDOERS_FILE" << 'RHEL_EOF'
+# Hostiqo - Automated Management Permissions (RHEL/Rocky/Alma)
+# Web server user: nginx
+
+# Nginx Management
+nginx ALL=(ALL) NOPASSWD: /usr/sbin/nginx -t
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start nginx
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop nginx
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload nginx
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx
+
+# Certbot - SSL Certificate Management
+nginx ALL=(ALL) NOPASSWD: /usr/bin/certbot
+nginx ALL=(ALL) NOPASSWD: /usr/bin/test -f /etc/letsencrypt/live/*/fullchain.pem
+nginx ALL=(ALL) NOPASSWD: /usr/bin/test -f /etc/letsencrypt/live/*/privkey.pem
+
+# PHP-FPM Pool Management (Remi style)
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start php*-php-fpm
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop php*-php-fpm
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload php*-php-fpm
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart php*-php-fpm
+
+# File Management - PHP-FPM Pool Config Files (Remi)
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/[a-zA-Z0-9._-]* /etc/opt/remi/php*/php-fpm.d/[a-zA-Z0-9._-]*.conf
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/opt/remi/php*/php-fpm.d/[a-zA-Z0-9._-]*.conf
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/opt/remi/php*/php-fpm.d/[a-zA-Z0-9._-]*.conf
+
+# File Management - Nginx Config Files
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/[a-zA-Z0-9._-]* /etc/nginx/conf.d/[a-zA-Z0-9._-]*.conf
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/nginx/conf.d/[a-zA-Z0-9._-]*.conf
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/nginx/conf.d/[a-zA-Z0-9._-]*.conf
+
+# Webroot Directory Management
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /var/www/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /var/www/[a-zA-Z0-9._-]*/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chown -R [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/www/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chown [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/www/[a-zA-Z0-9._-]*/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod -R [0-9]* /var/www/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod [0-9]* /var/www/[a-zA-Z0-9._-]*/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/* /var/www/[a-zA-Z0-9._-]*/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mv /tmp/* /var/www/[a-zA-Z0-9._-]*/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -rf /var/www/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/find /var/www/[a-zA-Z0-9._-]* *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/test -d /var/www/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/test -f /var/www/*/*
+
+# Nginx Cache Directory
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /var/cache/nginx/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chown -R [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/cache/nginx/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod -R [0-9]* /var/cache/nginx/*
+
+# PHP-FPM Log Directory
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /var/log/php*-fpm
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chown [a-zA-Z0-9_-]*?[a-zA-Z0-9_-]* /var/log/php*-fpm
+
+# PM2 Process Control
+nginx ALL=(ALL) NOPASSWD: /usr/bin/pm2
+nginx ALL=(ALL) NOPASSWD: /usr/local/bin/pm2
+nginx ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /etc/pm2
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/[a-zA-Z0-9._-]* /etc/pm2/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/pm2/[a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/pm2/[a-zA-Z0-9._-]*
+
+# Supervisor - Process Manager
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/hostiqo-*.ini /etc/supervisord.d/*.ini
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/supervisord.d/*.ini
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/supervisord.d/*.ini
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl reread
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl update
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl start *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl stop *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl restart *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl status
+nginx ALL=(ALL) NOPASSWD: /usr/bin/tail -n * /var/log/supervisor/*.log
+
+# Systemd Service File Management
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/[a-zA-Z0-9._-]* /etc/systemd/system/[a-zA-Z0-9._-]*.service
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/systemd/system/[a-zA-Z0-9._-]*.service
+nginx ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/systemd/system/[a-zA-Z0-9._-]*.service
+
+# Systemd Service Control
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable [a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable [a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start [a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop [a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart [a-zA-Z0-9._-]*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload [a-zA-Z0-9._-]*
+
+# Service Management
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl status *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-enabled *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start supervisord
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop supervisord
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart supervisord
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload supervisord
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start redis
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop redis
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart redis
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start mariadb
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop mariadb
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart mariadb
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start fail2ban
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop fail2ban
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart fail2ban
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload fail2ban
+
+# Fail2ban Client Management
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client status
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client status *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client set * banip *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client set * unbanip *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client start *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client stop *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client reload
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * ignoreip
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * bantime
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * maxretry
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client get * findtime
+nginx ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client banned
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/fail2ban/jail.local
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cp /tmp/jail.local /etc/fail2ban/jail.local
+nginx ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /etc/fail2ban/jail.local
+
+# Firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/firewall-cmd
+nginx ALL=(ALL) NOPASSWD: /usr/bin/firewall-cmd *
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl start firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart firewalld
+nginx ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload firewalld
+
+# Journal logs
+nginx ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u * -n * --no-pager
+
+# Git
+nginx ALL=(ALL) NOPASSWD: /usr/bin/git
+
+# Crontab
+nginx ALL=(ALL) NOPASSWD: /usr/bin/crontab
+nginx ALL=(ALL) NOPASSWD: /usr/bin/crontab *
+
+# Log File Access
+nginx ALL=(ALL) NOPASSWD: /usr/bin/tail -n * /var/log/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/tail /var/log/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/cat /var/log/*
+nginx ALL=(ALL) NOPASSWD: /usr/bin/truncate -s 0 *
+
+# SELinux
+nginx ALL=(ALL) NOPASSWD: /usr/sbin/semanage fcontext *
+nginx ALL=(ALL) NOPASSWD: /usr/sbin/restorecon *
+nginx ALL=(ALL) NOPASSWD: /usr/sbin/setsebool *
+RHEL_EOF
+}
+
+configure_sudoers() {
+    print_header "Phase 2: Configuring Sudoers"
+    
+    SUDOERS_FILE="/etc/sudoers.d/hostiqo-manager"
+    
+    print_info "Creating sudoers configuration for $WEB_USER ($OS_FAMILY)..."
+
+    if [[ "$OS_FAMILY" = "rhel" ]]; then
+        configure_sudoers_rhel
+    else
+        configure_sudoers_debian
+    fi
+
+    chmod 0440 "$SUDOERS_FILE"
+    
+    # Validate sudoers
+    if visudo -c -f "$SUDOERS_FILE" > /dev/null 2>&1; then
+        print_success "Sudoers configuration is valid"
+    else
+        print_error "Sudoers configuration has errors!"
+        rm -f "$SUDOERS_FILE"
+        exit 1
+    fi
+    
+    # Setup PHP-FPM logs based on OS
+    print_info "Setting up PHP-FPM log directories..."
+    if [[ ! -f "/var/log/php-fpm.log" ]]; then
+        touch /var/log/php-fpm.log
+        chown $WEB_USER:$WEB_USER /var/log/php-fpm.log
+        chmod 644 /var/log/php-fpm.log
+    fi
+    
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        for php_version in $(ls -d /etc/php/*/ 2>/dev/null | grep -oP '\d+\.\d+' | sort -u); do
+            log_dir="/var/log/php${php_version}-fpm"
+            if [[ ! -d "$log_dir" ]]; then
+                mkdir -p "$log_dir"
+                chown $WEB_USER:$WEB_USER "$log_dir"
+                chmod 755 "$log_dir"
+            fi
+        done
+    else
+        # RHEL-based: Remi PHP logs are in /var/opt/remi/phpXX/log/php-fpm/
+        for php_dir in /var/opt/remi/php*/log/php-fpm; do
+            if [[ -d "$php_dir" ]]; then
+                chown -R $WEB_USER:$WEB_USER "$php_dir" 2>/dev/null || true
+            fi
+        done
+    fi
+    print_success "PHP-FPM logs configured"
+    
+    print_success "Phase 2 completed!"
+}
+
+#########################################################
+# PHASE 3: Application Setup
+#########################################################
+setup_application() {
+    print_header "Phase 3: Setting Up Application"
+    
+    print_info "Application directory: $APP_DIR"
+    
+    # Set ownership of app directory
+    print_info "Setting ownership to $WEB_USER..."
+    chown -R $WEB_USER:$WEB_USER "$APP_DIR"
+    
+    # Create .env if not exists
+    if [[ ! -f "$APP_DIR/.env" ]]; then
+        print_info "Creating .env file..."
+        sudo -u $WEB_USER cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+        print_success ".env file created"
+    fi
+    
+    # Install Composer dependencies
+    print_info "Installing Composer dependencies..."
+    cd "$APP_DIR"
+    sudo -u $WEB_USER composer install --no-interaction --prefer-dist --optimize-autoloader --quiet
+    print_success "Composer dependencies installed"
+    
+    # Generate application key
+    if ! grep -q "APP_KEY=base64:" "$APP_DIR/.env"; then
+        print_info "Generating application key..."
+        sudo -u $WEB_USER php artisan key:generate --force > /dev/null 2>&1
+        print_success "Application key generated"
+    fi
+    
+    # Create required directories
+    print_info "Creating required directories..."
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/app/public"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/app/ssh-keys"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/framework/cache"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/framework/sessions"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/framework/views"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/logs"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/server/nginx"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/server/php-fpm"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/storage/server/pm2"
+    sudo -u $WEB_USER mkdir -p "$APP_DIR/bootstrap/cache"
+    print_success "Directories created"
+    
+    # Set permissions
+    chmod -R 755 "$APP_DIR/storage"
+    chmod -R 755 "$APP_DIR/bootstrap/cache"
+    chown -R $WEB_USER:$WEB_USER "$APP_DIR/storage"
+    chown -R $WEB_USER:$WEB_USER "$APP_DIR/bootstrap/cache"
+    print_success "Permissions set"
+    
+    # Database Setup
+    print_header "Database Configuration"
+    
+    read_input -p "Setup database automatically? (y/n, default: y): " SETUP_DB
+    SETUP_DB=${SETUP_DB:-y}
+    
+    if [[ "$SETUP_DB" =~ ^[Yy]$ ]]; then
+        read_input -p "Database name (default: hostiqo_db): " DB_NAME
+        DB_NAME=${DB_NAME:-hostiqo_db}
+        
+        read_input -p "Database user (default: hostiqo_user): " DB_USER
+        DB_USER=${DB_USER:-hostiqo_user}
+        
+        read_input -sp "Database password: " DB_PASS
+        echo ""
+        
+        if [[ -z "$DB_PASS" ]]; then
+            print_error "Password cannot be empty!"
+            exit 1
+        fi
+        
+        # Read MySQL root password
+        if [[ -f /root/.mysql_root_password ]]; then
+            MYSQL_ROOT_PASS=$(cat /root/.mysql_root_password)
+            print_info "Using MySQL root password from /root/.mysql_root_password"
+        else
+            read_input -sp "MySQL root password: " MYSQL_ROOT_PASS
+            echo ""
+        fi
+        
+        # Create database and user
+        print_info "Creating database and user..."
+        # Escape single quotes for MySQL string literals
+        DB_PASS_SQL=$(printf '%s' "$DB_PASS" | sed "s/'/\\\\'/g")
+        mysql -u root -p"$MYSQL_ROOT_PASS" << MYSQL_SCRIPT > /dev/null 2>&1
+CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS_SQL';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+GRANT CREATE, DROP, ALTER ON *.* TO '$DB_USER'@'localhost';
+GRANT CREATE USER ON *.* TO '$DB_USER'@'localhost';
+GRANT RELOAD ON *.* TO '$DB_USER'@'localhost';
+GRANT ALL PRIVILEGES ON \`%\`.* TO '$DB_USER'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+MYSQL_SCRIPT
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "Database '$DB_NAME' and user '$DB_USER' created"
+            
+            # Update .env — wrap password in double quotes to handle special chars (#, !)
+            # Escape chars that break sed's | delimiter and replacement (\, &, |)
+            DB_PASS_SAFE=$(printf '%s' "$DB_PASS" | sed 's/\\/\\\\/g; s/|/\\|/g; s/&/\\&/g')
+            sed -i "s|DB_DATABASE=.*|DB_DATABASE=$DB_NAME|" "$APP_DIR/.env"
+            sed -i "s|DB_USERNAME=.*|DB_USERNAME=$DB_USER|" "$APP_DIR/.env"
+            sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=\"${DB_PASS_SAFE}\"|" "$APP_DIR/.env"
+            print_success ".env updated with database credentials"
+        else
+            print_error "Failed to create database"
+        fi
+    fi
+    
+    # Run migrations
+    print_info "Running database migrations..."
+    if sudo -u $WEB_USER php artisan migrate --force > /dev/null 2>&1; then
+        print_success "Migrations completed"
+        
+        # Seed firewall rules (only if table is empty)
+        FIREWALL_COUNT=$(sudo -u $WEB_USER php artisan tinker --execute="echo \App\Models\FirewallRule::count();" 2>/dev/null | tail -1)
+        if [[ "$FIREWALL_COUNT" = "0" ]] || [[ -z "$FIREWALL_COUNT" ]]; then
+            sudo -u $WEB_USER php artisan db:seed --class=FirewallRuleSeeder --force > /dev/null 2>&1 || true
+            print_success "Firewall rules seeded"
+        else
+            print_info "Firewall rules already exist, skipping seeder"
+        fi
+    fi
+    
+    # Create admin user
+    echo ""
+    read_input -p "Create admin user? (y/n, default: y): " CREATE_ADMIN
+    CREATE_ADMIN=${CREATE_ADMIN:-y}
+    
+    if [[ "$CREATE_ADMIN" =~ ^[Yy]$ ]]; then
+        read_input -p "Admin name (default: Admin): " ADMIN_NAME
+        ADMIN_NAME=${ADMIN_NAME:-Admin}
+        
+        read_input -p "Admin email: " ADMIN_EMAIL
+        read_input -sp "Admin password: " ADMIN_PASS
+        echo ""
+        
+        if [[ -n "$ADMIN_EMAIL" ]] && [[ -n "$ADMIN_PASS" ]]; then
+            sudo -u $WEB_USER php artisan tinker --execute="
+                \$user = new App\Models\User();
+                \$user->name = '$ADMIN_NAME';
+                \$user->email = '$ADMIN_EMAIL';
+                \$user->password = Hash::make('$ADMIN_PASS');
+                \$user->save();
+                echo 'User created';
+            " > /dev/null 2>&1 && print_success "Admin user created" || print_error "Failed to create admin"
+        fi
+    fi
+    
+    # Build frontend assets
+    if [[ -f "$APP_DIR/package.json" ]]; then
+        print_info "Installing npm dependencies..."
+        cd "$APP_DIR"
+        sudo -u $WEB_USER npm install --silent > /dev/null 2>&1
+        print_info "Building frontend assets..."
+        sudo -u $WEB_USER npm run build > /dev/null 2>&1
+        print_success "Frontend assets built"
+    fi
+    
+    # Create storage link
+    sudo -u $WEB_USER php artisan storage:link > /dev/null 2>&1
+    
+    # Optimize
+    print_info "Optimizing application..."
+    sudo -u $WEB_USER php artisan config:cache > /dev/null 2>&1
+    sudo -u $WEB_USER php artisan route:cache > /dev/null 2>&1
+    sudo -u $WEB_USER php artisan view:cache > /dev/null 2>&1
+    print_success "Application optimized"
+    
+    # Setup Supervisor configs based on OS
+    print_info "Creating Supervisor configurations..."
+    
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        # Debian/Ubuntu: /etc/supervisor/conf.d/*.conf
+        SUPERVISOR_DIR="/etc/supervisor/conf.d"
+        SUPERVISOR_EXT="conf"
+    else
+        # RHEL-based: /etc/supervisord.d/*.ini
+        SUPERVISOR_DIR="/etc/supervisord.d"
+        SUPERVISOR_EXT="ini"
+    fi
+
+    mkdir -p "$SUPERVISOR_DIR"
+
+    cat > "$SUPERVISOR_DIR/hostiqo-queue.$SUPERVISOR_EXT" << EOF
+[program:hostiqo-queue]
+process_name=%(program_name)s_%(process_num)02d
+command=php artisan queue:work --sleep=3 --tries=3 --max-time=3600
+directory=$APP_DIR
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+user=$WEB_USER
+numprocs=2
+redirect_stderr=true
+stdout_logfile=$APP_DIR/storage/logs/queue-worker.log
+stopwaitsecs=3600
+EOF
+
+    cat > "$SUPERVISOR_DIR/hostiqo-scheduler.$SUPERVISOR_EXT" << EOF
+[program:hostiqo-scheduler]
+process_name=%(program_name)s
+command=php artisan schedule:work
+directory=$APP_DIR
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+user=$WEB_USER
+redirect_stderr=true
+stdout_logfile=$APP_DIR/storage/logs/scheduler.log
+EOF
+
+    supervisorctl reread > /dev/null 2>&1
+    supervisorctl update > /dev/null 2>&1
+    print_success "Supervisor configs installed"
+    
+    print_success "Phase 3 completed!"
+}
+
+#########################################################
+# PHASE 4: Web Server Configuration
+#########################################################
+setup_webserver() {
+    print_header "Phase 4: Web Server Configuration"
+    
+    # Ask if user wants to use domain or IP-only mode
+    read_input -p "Do you have a domain name ready? (y/n, default: y): " HAS_DOMAIN
+    HAS_DOMAIN=${HAS_DOMAIN:-y}
+    
+    if [[ "$HAS_DOMAIN" =~ ^[Nn]$ ]]; then
+        # IP-only mode with custom port
+        read_input -p "Enter custom port for Hostiqo (default: 8000): " CUSTOM_PORT
+        CUSTOM_PORT=${CUSTOM_PORT:-8000}
+        
+        # Get server IP
+        SERVER_IP=$(hostname -I | awk '{print $1}')
+        if [[ -z "$SERVER_IP" ]]; then
+            SERVER_IP="_"
+        fi
+        
+        SERVER_NAME="$SERVER_IP"
+        LISTEN_PORT="$CUSTOM_PORT"
+        USE_CUSTOM_PORT=true
+        SETUP_SSL="n"
+        INCLUDE_WWW="n"
+        
+        # Open custom port in firewall
+        if command -v ufw &> /dev/null; then
+            ufw allow $CUSTOM_PORT/tcp > /dev/null 2>&1 || true
+            print_success "Firewall: Port $CUSTOM_PORT opened (ufw)"
+        elif command -v firewall-cmd &> /dev/null; then
+            firewall-cmd --permanent --add-port=$CUSTOM_PORT/tcp > /dev/null 2>&1 || true
+            firewall-cmd --reload > /dev/null 2>&1 || true
+            print_success "Firewall: Port $CUSTOM_PORT opened (firewalld)"
+        fi
+        
+        print_info "Hostiqo will be accessible at: http://$SERVER_IP:$CUSTOM_PORT"
+    else
+        # Domain mode
+        read_input -p "Enter your domain name (e.g., hostiqo.example.com): " DOMAIN_NAME
+        if [[ -z "$DOMAIN_NAME" ]]; then
+            print_error "Domain name is required!"
+            exit 1
+        fi
+        
+        read_input -p "Include www subdomain? (y/n, default: n): " INCLUDE_WWW
+        INCLUDE_WWW=${INCLUDE_WWW:-n}
+        
+        if [[ "$INCLUDE_WWW" =~ ^[Yy]$ ]]; then
+            SERVER_NAME="$DOMAIN_NAME www.$DOMAIN_NAME"
+            SSL_DOMAINS="-d $DOMAIN_NAME -d www.$DOMAIN_NAME"
+        else
+            SERVER_NAME="$DOMAIN_NAME"
+            SSL_DOMAINS="-d $DOMAIN_NAME"
+        fi
+        
+        LISTEN_PORT="80"
+        USE_CUSTOM_PORT=false
+        
+        read_input -p "Setup SSL certificate? (y/n, default: y): " SETUP_SSL
+        SETUP_SSL=${SETUP_SSL:-y}
+        
+        if [[ "$SETUP_SSL" =~ ^[Yy]$ ]]; then
+            read_input -p "Email for SSL notifications: " SSL_EMAIL
+            SSL_EMAIL=${SSL_EMAIL:-admin@$DOMAIN_NAME}
+        fi
+    fi
+    
+    # Detect PHP version and socket path based on OS
+    PHP_VERSION=$(php -v | grep -oP 'PHP \K[0-9]+\.[0-9]+' | head -1)
+
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        PHP_SOCKET="/var/run/php/php${PHP_VERSION}-fpm.sock"
+        NGINX_CONF_DIR="/etc/nginx/sites-available"
+        NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
+    else
+        # RHEL-based: Remi PHP uses different socket path
+        PHP_VERSION_NODOT=$(echo $PHP_VERSION | tr -d '.')
+        PHP_SOCKET="/var/opt/remi/php${PHP_VERSION_NODOT}/run/php-fpm/www.sock"
+        NGINX_CONF_DIR="/etc/nginx/conf.d"
+        NGINX_ENABLED_DIR=""  # RHEL doesn't use sites-enabled
+    fi
+    
+    # Create Nginx config
+    print_info "Creating Nginx configuration..."
+    
+    # Ensure nginx config directories exist
+    mkdir -p "$NGINX_CONF_DIR"
+    if [[ -n "$NGINX_ENABLED_DIR" ]]; then
+        mkdir -p "$NGINX_ENABLED_DIR"
+    fi
+    
+    # Determine config file path
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        NGINX_CONF_FILE="$NGINX_CONF_DIR/hostiqo"
+    else
+        NGINX_CONF_FILE="$NGINX_CONF_DIR/hostiqo.conf"
+    fi
+
+    cat > "$NGINX_CONF_FILE" << EOF
+server {
+    listen $LISTEN_PORT;
+    listen [::]:$LISTEN_PORT;
+    server_name $SERVER_NAME;
+    root $APP_DIR/public;
+
+    index index.php index.html;
+    charset utf-8;
+
+    access_log /var/log/nginx/hostiqo-access.log combined buffer=512k flush=1m;
+    error_log /var/log/nginx/hostiqo-error.log warn;
+
+    # Performance - Buffer Tuning
+    client_max_body_size 100M;
+    client_body_buffer_size 128k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 16k;
+    
+    # Timeouts
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+    keepalive_timeout 65s;
+    send_timeout 60s;
+    
+    # Hide server info
+    server_tokens off;
+
+    # Security Headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    # Gzip Compression
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+        
+        # FastCGI Tuning
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 256 16k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
+        fastcgi_read_timeout 300s;
+        fastcgi_connect_timeout 60s;
+        fastcgi_send_timeout 300s;
+    }
+
+    # Allow ACME challenge for SSL certificate renewal
+    location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root $APP_DIR/public;
+    }
+
+    # Block dotfiles (except .well-known above)
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Block sensitive files
+    location ~* \.(env|log|sql|sqlite|bak|backup|old|orig|save|swp|tmp)\$ {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+    
+    # Block access to sensitive directories
+    location ~* ^/(\.git|\.svn|\.hg|vendor|node_modules|storage/logs|storage/framework) {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Static files caching
+    location ~* \.(jpg|jpeg|png|gif|ico|webp|avif)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+    
+    location ~* \.(css|js)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+    
+    location ~* \.(svg|woff|woff2|ttf|eot|otf)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        add_header Access-Control-Allow-Origin "*";
+        access_log off;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; expires 1y; }
+    location = /robots.txt { access_log off; log_not_found off; }
+}
+EOF
+
+    # Enable site (Debian uses symlinks, RHEL uses conf.d directly)
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        ln -sf "$NGINX_CONF_FILE" "$NGINX_ENABLED_DIR/hostiqo"
+    fi
+    
+    # Test and reload Nginx
+    if nginx -t > /dev/null 2>&1; then
+        systemctl reload nginx
+        print_success "Nginx configured and reloaded"
+    else
+        print_error "Nginx configuration error!"
+        nginx -t
+        exit 1
+    fi
+    
+    # SSL Setup
+    if [[ "$SETUP_SSL" =~ ^[Yy]$ ]]; then
+        print_info "Requesting SSL certificate..."
+        
+        # Create SSL snippets first
+        mkdir -p /etc/nginx/snippets
+        cat > /etc/nginx/snippets/ssl-params.conf << 'SSLEOF'
+# SSL Hardening - Modern Configuration
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+
+# OCSP Stapling
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 valid=300s;
+resolver_timeout 5s;
+
+# HSTS (2 years)
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+SSLEOF
+
+        # Request certificate using certonly (no auto-config)
+        if certbot certonly --webroot -w $APP_DIR/public $SSL_DOMAINS --non-interactive --agree-tos --email "$SSL_EMAIL" > /dev/null 2>&1; then
+            print_success "SSL certificate obtained"
+            
+            # Extract primary domain for cert path
+            PRIMARY_DOMAIN=$(echo $SSL_DOMAINS | sed 's/-d //g' | awk '{print $1}')
+            CERT_PATH="/etc/letsencrypt/live/$PRIMARY_DOMAIN"
+            
+            # Add SSL configuration to Nginx
+            print_info "Configuring Nginx with SSL..."
+            
+            # Backup current config
+            cp "$NGINX_CONF_FILE" "${NGINX_CONF_FILE}.bak"
+            
+            # Create new config with HTTP redirect + SSL block
+            cat > "$NGINX_CONF_FILE" << HTTPREDIRECT
+# HTTP to HTTPS redirect
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_NAME;
+    
+    # Allow ACME challenge for SSL certificate renewal
+    location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root $APP_DIR/public;
+    }
+    
+    # Redirect all other requests to HTTPS
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+HTTPREDIRECT
+
+            # Append the SSL block back
+            cat >> "$NGINX_CONF_FILE" << SSLCONF2
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $SERVER_NAME;
+    root $APP_DIR/public;
+
+    # SSL Certificate
+    ssl_certificate ${CERT_PATH}/fullchain.pem;
+    ssl_certificate_key ${CERT_PATH}/privkey.pem;
+    ssl_trusted_certificate ${CERT_PATH}/chain.pem;
+    
+    # Include SSL hardening params
+    include /etc/nginx/snippets/ssl-params.conf;
+
+    index index.php index.html;
+    charset utf-8;
+
+    access_log /var/log/nginx/hostiqo-access.log combined buffer=512k flush=1m;
+    error_log /var/log/nginx/hostiqo-error.log warn;
+
+    # Performance - Buffer Tuning
+    client_max_body_size 100M;
+    client_body_buffer_size 128k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 16k;
+    
+    # Timeouts
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+    keepalive_timeout 65s;
+    send_timeout 60s;
+    
+    # Hide server info
+    server_tokens off;
+
+    # Security Headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    # Gzip Compression
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+        
+        # FastCGI Tuning
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 256 16k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
+        fastcgi_read_timeout 300s;
+        fastcgi_connect_timeout 60s;
+        fastcgi_send_timeout 300s;
+    }
+
+    # Allow ACME challenge for SSL certificate renewal
+    location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root $APP_DIR/public;
+    }
+
+    # Block dotfiles (except .well-known above)
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Block sensitive files
+    location ~* \.(env|log|sql|sqlite|bak|backup|old|orig|save|swp|tmp)\$ {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+    
+    # Block access to sensitive directories
+    location ~* ^/(\.git|\.svn|\.hg|vendor|node_modules|storage/logs|storage/framework) {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Static file caching
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        add_header Access-Control-Allow-Origin "*";
+        access_log off;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; expires 1y; }
+    location = /robots.txt { access_log off; log_not_found off; }
+}
+SSLCONF2
+            
+            # Test and reload Nginx
+            if nginx -t > /dev/null 2>&1; then
+                systemctl reload nginx
+                print_success "SSL configured and Nginx reloaded"
+            else
+                print_error "Nginx configuration error! Restoring backup..."
+                mv "${NGINX_CONF_FILE}.bak" "$NGINX_CONF_FILE"
+                systemctl reload nginx
+                exit 1
+            fi
+        else
+            print_warning "SSL certificate request failed - run manually: sudo certbot certonly --webroot -w $APP_DIR/public $SSL_DOMAINS"
+        fi
+    fi
+    
+    # Configure SELinux context for web directory on RHEL
+    if [[ "$OS_FAMILY" = "rhel" ]] && command -v semanage &> /dev/null; then
+        print_info "Setting SELinux context for web directory..."
+        semanage fcontext -a -t httpd_sys_rw_content_t "$APP_DIR/storage(/.*)?" > /dev/null 2>&1 || true
+        semanage fcontext -a -t httpd_sys_rw_content_t "$APP_DIR/bootstrap/cache(/.*)?" > /dev/null 2>&1 || true
+        restorecon -Rv "$APP_DIR" > /dev/null 2>&1 || true
+        print_success "SELinux context configured"
+    fi
+
+    # Update APP_URL in .env based on domain and SSL setting
+    print_info "Updating APP_URL in .env..."
+    if [[ "$SETUP_SSL" =~ ^[Yy]$ ]]; then
+        APP_URL="https://$DOMAIN_NAME"
+    else
+        APP_URL="http://$DOMAIN_NAME"
+    fi
+    sed -i "s|APP_URL=.*|APP_URL=$APP_URL|" "$APP_DIR/.env"
+    print_success "APP_URL set to $APP_URL"
+    
+    # Clear config cache to apply new APP_URL
+    cd "$APP_DIR"
+    sudo -u $WEB_USER php artisan config:clear > /dev/null 2>&1 || true
+
+    # Start services
+    print_info "Starting services..."
+    supervisorctl start hostiqo-queue:* > /dev/null 2>&1 || true
+    supervisorctl start hostiqo-scheduler:* > /dev/null 2>&1 || true
+    print_success "Services started"
+    
+    print_success "Phase 4 completed!"
+}
+
+#########################################################
+# CLONE/SETUP REPOSITORY
+#########################################################
+setup_repository() {
+    print_header "Repository Setup"
+    
+    # Check if already exists
+    if [[ -d "$DEFAULT_APP_DIR" ]] && [[ -f "$DEFAULT_APP_DIR/artisan" ]]; then
+        print_info "Hostiqo already exists at $DEFAULT_APP_DIR"
+        read_input -p "Use existing installation? (y/n, default: y): " USE_EXISTING
+        USE_EXISTING=${USE_EXISTING:-y}
+        
+        if [[ "$USE_EXISTING" =~ ^[Yy]$ ]]; then
+            APP_DIR="$DEFAULT_APP_DIR"
+            print_success "Using existing installation: $APP_DIR"
+            return 0
+        else
+            print_info "Removing existing installation..."
+            rm -rf "$DEFAULT_APP_DIR"
+        fi
+    fi
+    
+    # Ask for installation path
+    read_input -p "Installation path (default: $DEFAULT_APP_DIR): " CUSTOM_PATH
+    APP_DIR=${CUSTOM_PATH:-$DEFAULT_APP_DIR}
+    
+    # Create parent directory
+    mkdir -p "$(dirname "$APP_DIR")"
+    
+    # Clone repository
+    print_info "Cloning Hostiqo repository..."
+    print_info "Repository: $REPO_URL"
+    print_info "Destination: $APP_DIR"
+    
+    if git clone "$REPO_URL" "$APP_DIR" > /dev/null 2>&1; then
+        print_success "Repository cloned successfully"
+    else
+        print_error "Failed to clone repository"
+        print_info "You can clone manually:"
+        echo "  git clone $REPO_URL $APP_DIR"
+        exit 1
+    fi
+    
+    # Note: Ownership will be set after prerequisites install (when web user exists)
+    print_info "Ownership will be set after prerequisites installation"
+}
+
+#########################################################
+# MAIN EXECUTION
+#########################################################
+main() {
+    print_header "Hostiqo - Server Management Made Simple"
+    
+    check_root
+    detect_os
+    
+    echo ""
+    echo "This installer will:"
+    echo "  1. Clone Hostiqo repository to /var/www/hostiqo"
+    echo "  2. Install system prerequisites (Nginx, PHP, MySQL/MariaDB, Redis, etc.)"
+    echo "  3. Configure sudoers for $WEB_USER"
+    echo "  4. Setup Laravel application"
+    echo "  5. Configure web server and SSL"
+    echo ""
+    
+    read_input -p "Continue with installation? (y/n): " CONTINUE
+    if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+        print_info "Installation cancelled"
+        exit 0
+    fi
+    
+    # Run pre-flight checks first
+    preflight_check
+    
+    # Run all phases
+    setup_repository
+    install_prerequisites
+    configure_sudoers
+    setup_application
+    setup_webserver
+    
+    # Final summary
+    print_header "Installation Complete! 🎉"
+    
+    echo ""
+    print_success "Hostiqo has been installed successfully!"
+    echo ""
+    print_info "Detected OS: $OS_ID $OS_VERSION ($OS_FAMILY)"
+    print_info "Web user: $WEB_USER"
+    echo ""
+    print_info "Installed components:"
+    # Read installed versions from config
+    if [[ -f /etc/hostiqo/config.json ]]; then
+        INSTALLED_PHP=$(cat /etc/hostiqo/config.json | grep -o '"php_versions":\s*\[[^]]*\]' | grep -o '\["[^"]*"' | tr -d '[]"' | tr ',' ', ' 2>/dev/null || echo "8.2, 8.3")
+        INSTALLED_NODE=$(cat /etc/hostiqo/config.json | grep -o '"node_version":\s*"[^"]*"' | grep -o '"[0-9]*"' | tr -d '"' 2>/dev/null || echo "20")
+    else
+        INSTALLED_PHP="8.2, 8.3"
+        INSTALLED_NODE="20"
+    fi
+    
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        echo "  • Nginx, PHP ${INSTALLED_PHP}, MySQL, Redis"
+    else
+        echo "  • Nginx, PHP ${INSTALLED_PHP}, MariaDB, Redis"
+    fi
+    echo "  • Composer, Node.js ${INSTALLED_NODE}, PM2"
+    echo "  • Supervisor, Certbot, fail2ban"
+    echo ""
+    print_info "Important files:"
+    echo "  • Database root password: /root/.mysql_root_password"
+    if [[ "$OS_FAMILY" = "debian" ]]; then
+        echo "  • Nginx config: /etc/nginx/sites-available/hostiqo"
+    else
+        echo "  • Nginx config: /etc/nginx/conf.d/hostiqo.conf"
+    fi
+    echo "  • App logs: $APP_DIR/storage/logs/"
+    echo ""
+    if [[ "$USE_CUSTOM_PORT" = true ]]; then
+        print_info "Access your panel at: http://$SERVER_IP:$CUSTOM_PORT"
+        echo ""
+        print_info "Note: You can later switch to domain mode by re-running:"
+        echo "  sudo bash $APP_DIR/scripts/install.sh --phase4"
+    elif [[ "$SETUP_SSL" =~ ^[Yy]$ ]]; then
+        print_info "Access your panel at: https://$DOMAIN_NAME"
+    else
+        print_info "Access your panel at: http://$DOMAIN_NAME"
+    fi
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    print_info "💖 Support Hostiqo Development"
+    echo ""
+    echo "Hostiqo.dev is maintained by a solo developer."
+    echo "Donations help ensure long-term stability, security fixes, and faster updates."
+    echo ""
+    echo "If you're using Hostiqo in production, we do offer sponsor tiers"
+    echo "for SLA & priority fixes."
+    echo ""
+    echo "Sponsor: https://toyyibpay.com/sponsor-hostiqo"
+    echo "GitHub Sponsors: https://thanks.dev/u/gh/hymns"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
+# Parse command line arguments
+case "${1:-}" in
+    --preflight|--check)
+        check_root
+        preflight_check
+        ;;
+    --phase1|--prerequisites)
+        check_root
+        preflight_check
+        detect_os
+        install_prerequisites
+        ;;
+    --phase2|--sudoers)
+        check_root
+        detect_os
+        configure_sudoers
+        ;;
+    --phase3|--app)
+        check_root
+        detect_os
+        APP_DIR="${2:-/var/www/hostiqo}"
+        setup_application
+        ;;
+    --phase4|--webserver)
+        check_root
+        detect_os
+        APP_DIR="${2:-/var/www/hostiqo}"
+        setup_webserver
+        ;;
+    --phase5|--tune-database)
+        check_root
+        detect_os
+        tune_database
+        ;;
+    --help|-h)
+        echo "Hostiqo Installer"
+        echo ""
+        echo "Usage: sudo bash install.sh [option]"
+        echo ""
+        echo "Supported OS:"
+        echo "  - Ubuntu / Debian"
+        echo "  - Rocky Linux / AlmaLinux / CentOS / RHEL"
+        echo ""
+        echo "Options:"
+        echo "  (no option)      Run full installation"
+        echo "  --preflight      Run pre-flight checks only"
+        echo "  --phase1         Install system prerequisites only"
+        echo "  --phase2         Configure sudoers only"
+        echo "  --phase3 [path]  Setup Laravel application only"
+        echo "  --phase4 [path]  Configure web server only"
+        echo "  --phase5         Tune MySQL/MariaDB based on server RAM/CPU"
+        echo "  --help           Show this help"
+        echo ""
+        ;;
+    *)
+        main
+        ;;
+esac

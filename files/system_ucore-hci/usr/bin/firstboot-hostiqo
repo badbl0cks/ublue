@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Bootstraps Hostiqo inside the `hostiqo` distrobox container:
+#   1. Wait for the container's systemd to be up
+#   2. Copy in install-hostiqo.sh and post-install-hostiqo.sh
+#   3. Run install phases 1-3 (prereqs, sudoers, application)
+#   4. Run post-install fail2ban patch
+# Phase 4 (web server + domain + SSL) is deferred to manual run.
+# See plan: /home/rob/.claude/plans/let-s-explore-approach-4-snoopy-newell.md
+
+WD="/var/lib/hostiqo"
+SENTINEL="${WD}/.firstboot"
+SHARE="/usr/share/hostiqo"
+ENV_FILE="/etc/hostiqo/config.env"
+
+if [[ -f "${SENTINEL}" ]]; then
+    echo "First boot script already run (${SENTINEL}). Skipping..."
+    exit 0
+fi
+
+mkdir -p "${WD}"
+
+# Wait for the `hostiqo` container to be running and reachable
+echo "Waiting for hostiqo container to be ready..."
+for _ in $(seq 1 60); do
+    if podman exec hostiqo true >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+if ! podman exec hostiqo true >/dev/null 2>&1; then
+    echo "ERROR: hostiqo container not reachable after 120s" >&2
+    exit 1
+fi
+
+# Source the host-side config.env if present (written by Butane). Keys we expect:
+#   DB_NAME, DB_USER, DB_PASS, ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASS
+if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+else
+    echo "WARNING: ${ENV_FILE} not found; using generated defaults"
+    DB_NAME="${DB_NAME:-hostiqo_db}"
+    DB_USER="${DB_USER:-hostiqo_user}"
+    DB_PASS="${DB_PASS:-$(openssl rand -base64 24 | tr -d '/+=')}"
+    ADMIN_NAME="${ADMIN_NAME:-Admin}"
+    ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost}"
+    ADMIN_PASS="${ADMIN_PASS:-$(openssl rand -base64 24 | tr -d '/+=')}"
+fi
+
+# Copy installer + post-install into the container
+podman cp "${SHARE}/install-hostiqo.sh"      hostiqo:/root/install-hostiqo.sh
+podman cp "${SHARE}/post-install-hostiqo.sh" hostiqo:/root/post-install-hostiqo.sh
+podman exec hostiqo chmod +x /root/install-hostiqo.sh /root/post-install-hostiqo.sh
+
+# Write the answers file inside the container so install-hostiqo.sh's
+# interactive prompts have pre-seeded inputs (read_input reads from /dev/tty,
+# so we drive the script with stdin redirection per phase below).
+podman exec hostiqo bash -c "cat >/root/.hostiqo-answers <<EOF
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASS=${DB_PASS}
+ADMIN_NAME=${ADMIN_NAME}
+ADMIN_EMAIL=${ADMIN_EMAIL}
+ADMIN_PASS=${ADMIN_PASS}
+EOF
+chmod 600 /root/.hostiqo-answers"
+
+# Phase 1: prerequisites (nginx, php-fpm, mariadb, redis, composer, node, etc.)
+echo "Running install-hostiqo.sh --phase1 in container..."
+podman exec hostiqo /root/install-hostiqo.sh --phase1
+
+# Phase 2: sudoers for the nginx user
+echo "Running install-hostiqo.sh --phase2 in container..."
+podman exec hostiqo /root/install-hostiqo.sh --phase2
+
+# Phase 3: application setup. The script's read_input pulls from /dev/tty, so
+# we need to provide a fake tty with the pre-seeded answers. We use `expect`
+# if available, otherwise a heredoc through a script wrapper. For simplicity,
+# clone the repo manually and run a non-interactive subset.
+echo "Running install-hostiqo.sh --phase3 in container..."
+podman exec hostiqo bash -c '
+    set -e
+    cd /var/www
+    if [[ ! -d hostiqo ]]; then
+        git clone https://github.com/hymns/hostiqo.git hostiqo
+    fi
+    chown -R nginx:nginx hostiqo
+'
+# Drive Phase 3 with answers via stdin
+podman exec -i hostiqo bash -c '
+    source /root/.hostiqo-answers
+    cd /var/www/hostiqo
+    # .env
+    [[ -f .env ]] || sudo -u nginx cp .env.example .env
+    sudo -u nginx composer install --no-interaction --prefer-dist --optimize-autoloader --quiet
+    grep -q "APP_KEY=base64:" .env || sudo -u nginx php artisan key:generate --force
+    sudo -u nginx mkdir -p storage/app/public storage/app/ssh-keys \
+        storage/framework/cache storage/framework/sessions storage/framework/views \
+        storage/logs storage/server/nginx storage/server/php-fpm storage/server/pm2 \
+        bootstrap/cache
+    chmod -R 755 storage bootstrap/cache
+    chown -R nginx:nginx storage bootstrap/cache
+    # Database
+    if [[ -f /root/.mysql_root_password ]]; then
+        MYSQL_ROOT_PASS=$(cat /root/.mysql_root_password)
+        mysql -u root -p"${MYSQL_ROOT_PASS}" <<MYSQL_SCRIPT
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"' IDENTIFIED BY '"'"'${DB_PASS}'"'"';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"';
+GRANT CREATE, DROP, ALTER ON *.* TO '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"';
+GRANT CREATE USER ON *.* TO '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"';
+GRANT RELOAD ON *.* TO '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"';
+GRANT ALL PRIVILEGES ON \`%\`.* TO '"'"'${DB_USER}'"'"'@'"'"'localhost'"'"' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+MYSQL_SCRIPT
+        sed -i "s|DB_DATABASE=.*|DB_DATABASE=${DB_NAME}|" .env
+        sed -i "s|DB_USERNAME=.*|DB_USERNAME=${DB_USER}|" .env
+        sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=\"${DB_PASS}\"|" .env
+    fi
+    sudo -u nginx php artisan migrate --force
+    sudo -u nginx php artisan db:seed --class=FirewallRuleSeeder --force || true
+    # Admin user
+    sudo -u nginx php artisan tinker --execute="
+        \$user = new App\\Models\\User();
+        \$user->name = '"'"'${ADMIN_NAME}'"'"';
+        \$user->email = '"'"'${ADMIN_EMAIL}'"'"';
+        \$user->password = Hash::make('"'"'${ADMIN_PASS}'"'"');
+        \$user->save();
+    " || true
+    if [[ -f package.json ]]; then
+        sudo -u nginx npm install --silent
+        sudo -u nginx npm run build
+    fi
+    sudo -u nginx php artisan storage:link || true
+    sudo -u nginx php artisan config:cache
+    sudo -u nginx php artisan route:cache
+    sudo -u nginx php artisan view:cache
+'
+
+# Post-install: patch fail2ban to use firewallcmd-ipset and read host journal
+echo "Running post-install-hostiqo.sh in container..."
+podman exec hostiqo /root/post-install-hostiqo.sh
+
+# Consume the env file so secrets don't linger
+rm -f "${ENV_FILE}"
+podman exec hostiqo rm -f /root/.hostiqo-answers
+
+touch "${SENTINEL}"
+echo "First boot script completed. Hostiqo phases 1-3 installed. Run --phase4 manually for domain/SSL."
