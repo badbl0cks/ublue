@@ -59,5 +59,4 @@ modules:
         - docker.service
         - sshd.service
         - firstboot-sshd.service
-        #
   - type: signing
