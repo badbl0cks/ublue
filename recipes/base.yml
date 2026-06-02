@@ -52,6 +52,7 @@ modules:
         - samba
         - ncdu
         - terra-release
+        - mono-complete
   - type: systemd
     system:
       enabled:

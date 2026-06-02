@@ -3,3 +3,4 @@ cosign.private
 /Containerfile
 *.bu
 install.yaml
+/.bluebuild-scripts_*
