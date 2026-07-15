@@ -54,6 +54,7 @@ modules:
         - terra-release
         - mono-core
         - mono-devel
+        - golang
   - type: systemd
     system:
       enabled:
