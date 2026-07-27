@@ -44,6 +44,8 @@ modules:
         - baobab
         - tilda
         - zed
+        - libgda
+        - libgda-sqlite
   - type: default-flatpaks@v1 # only v1 allows removals
     notify: true
     system:
