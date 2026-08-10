@@ -24,6 +24,11 @@ modules:
       keys:
         - https://packages.microsoft.com/keys/microsoft.asc
         - https://download.copr.fedorainfracloud.org/results/lizardbyte/stable/pubkey.gpg
+    group-install:
+      with-optional: true
+      packages:
+        - development-tools
+        - c-development
     install:
       packages:
         - vlc

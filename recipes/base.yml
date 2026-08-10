@@ -11,11 +11,6 @@ modules:
       keys:
         - https://repos.fyralabs.com/terra44/key.asc
         - https://download.docker.com/linux/fedora/gpg
-    group-install:
-      with-optional: true
-      packages:
-        - development-tools
-        - c-development
     remove:
       packages:
         - moby-engine
